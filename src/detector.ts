@@ -9,11 +9,11 @@ export const BUILT_IN_PATTERNS = {
 const URL_PATTERN = /\b(?:https?:\/\/|www\.)[^\s<]+|\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z]{2,})(?:\/[^\s<]*)?/gi;
 
 export function findUrls(content: string): string[] {
-  return content.match(URL_PATTERN) ?? [];
+  return (content.match(URL_PATTERN) ?? []).map((url) => url.replace(/[),.!?;:'"]+$/g, ""));
 }
 
 export function normalizeDomain(value: string): string {
-  return value.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").split(/[/?#]/)[0];
+  return value.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").split(/[/?#]/)[0].replace(/\.$/, "");
 }
 
 export function detectReasons(content: string, keywords: string[], domains: string[], patterns: string[]): string[] {
@@ -21,8 +21,11 @@ export function detectReasons(content: string, keywords: string[], domains: stri
   const urls = findUrls(content);
   const reasons: string[] = [];
   if (urls.length) reasons.push(`link (${urls.length})`);
+  const seenKeywords = new Set<string>();
   for (const keyword of keywords) {
-    if (lower.includes(keyword.toLowerCase())) reasons.push(`keyword: ${keyword}`);
+    const normalized = keyword.toLowerCase();
+    if (!seenKeywords.has(normalized) && lower.includes(normalized)) reasons.push(`keyword: ${keyword}`);
+    seenKeywords.add(normalized);
   }
   for (const domain of domains) {
     if (urls.some((url) => normalizeDomain(url) === domain || normalizeDomain(url).endsWith(`.${domain}`))) {

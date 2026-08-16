@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --prod
+      - run: pnpm test
+      - run: pnpm typecheck
+      - run: pnpm build
+      - name: Validate deployment assets
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          bash -n deploy/install.sh deploy/install-lib.sh deploy/install-lib.test.sh deploy/update.sh
+          shellcheck deploy/install.sh deploy/install-lib.sh deploy/install-lib.test.sh deploy/update.sh
+          bash deploy/install-lib.test.sh
+          systemd-analyze verify \
+            deploy/discord-deletion-monitor.service \
+            deploy/discord-deletion-monitor-backup.service \
+            deploy/discord-deletion-monitor-backup.timer

@@ -1,0 +1,49 @@
+[Unit]
+Description=Discord Deletion Monitor
+Documentation=https://github.com/2xJDubs/discord-deletion-monitor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=discord-monitor
+Group=discord-monitor
+WorkingDirectory=/opt/discord-deletion-monitor/current
+EnvironmentFile=/etc/discord-deletion-monitor.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node /opt/discord-deletion-monitor/current/dist/index.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=135s
+KillSignal=SIGTERM
+UMask=0077
+
+# The application and OS are read-only; only bot data is writable.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+RemoveIPC=true
+SystemCallArchitectures=native
+LockPersonality=true
+MemoryDenyWriteExecute=false
+MemoryMax=512M
+TasksMax=64
+LimitNOFILE=1024
+ReadWritePaths=/var/lib/discord-deletion-monitor
+
+[Install]
+WantedBy=multi-user.target

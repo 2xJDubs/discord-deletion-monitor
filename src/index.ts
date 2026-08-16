@@ -12,14 +12,60 @@ import {
 } from "discord.js";
 import { MessageStore, MonitorMode, RuleKind } from "./database.js";
 import { BUILT_IN_PATTERNS, detectReasons, normalizeDomain } from "./detector.js";
+import { downloadAttachments } from "./attachments.js";
+import { CaptureCoordinator } from "./coordinator.js";
+import { loadConfig } from "./config.js";
+import { deliverWithClaim } from "./delivery-claim.js";
+import { deliverEvidence } from "./evidence.js";
+import { createDeliveryRetryWorker } from "./retry-worker.js";
+import { ActiveWorkTracker, createJsonLogger, installGracefulShutdown, safeAsyncHandler } from "./runtime.js";
 
-const token = process.env.DISCORD_TOKEN;
-if (!token) throw new Error("DISCORD_TOKEN is required");
-
-const defaultRetentionHours = Math.max(1, Math.round(Number(process.env.RETENTION_HOURS ?? "336")));
-const store = new MessageStore(process.env.DATABASE_PATH ?? "./data/messages.db", defaultRetentionHours);
+const config = loadConfig();
+const log = createJsonLogger(config.logLevel);
+const store = new MessageStore(config.databasePath, config.retentionHours, {
+  busyTimeoutMs: config.databaseBusyTimeoutMs,
+  attachmentQuotaBytes: config.storedAttachmentMaxBytes,
+});
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+});
+const work = new ActiveWorkTracker();
+const coordinator = new CaptureCoordinator(
+  store,
+  (messageId, attachments, signal) => downloadAttachments(messageId, attachments, {
+    perFileBytes: config.attachmentMaxFileBytes,
+    totalBytes: config.attachmentMaxTotalBytes,
+    timeoutMs: config.attachmentDownloadTimeoutMs,
+    signal,
+  }, fetch, (event, fields) => log(event, fields, "warn")),
+  { concurrency: config.captureConcurrency, maxQueued: config.captureQueueMax },
+);
+
+const fetchReviewChannel = async (channelId: string) => {
+  const channel = await client.channels.fetch(channelId);
+  return channel?.isSendable() ? channel : null;
+};
+const deliverClaimed = (guildId: string, messageId: string, claimToken: string) => deliverEvidence(
+  guildId,
+  messageId,
+  claimToken,
+  store,
+  fetchReviewChannel,
+  (event, fields) => log(event, fields, event.endsWith("failed") ? "error" : "info"),
+);
+const deliver = (guildId: string, messageId: string) => deliverWithClaim(
+  guildId,
+  messageId,
+  store,
+  deliverClaimed,
+);
+const retryWorker = createDeliveryRetryWorker({
+  listDuePending: (now, limit) => store.listDuePending(now, limit),
+  deliver,
+  intervalMs: config.deliveryRetryIntervalMs,
+  batchSize: config.deliveryRetryBatchSize,
+  runWork: (task) => work.run(task),
+  log,
 });
 
 const command = new SlashCommandBuilder()
@@ -156,23 +202,31 @@ async function handleCommand(interaction: ChatInputCommandInteraction): Promise<
   await interaction.reply({ content: changed ? `Setting ${remove ? "removed" : "added"}.` : `That setting was already ${remove ? "absent" : "configured"}.`, ephemeral: true });
 }
 
-client.once(Events.ClientReady, async (readyClient) => {
-  const rest = new REST().setToken(token);
-  await rest.put(Routes.applicationCommands(readyClient.user.id), { body: [command.toJSON()] });
-  console.log(`Ready as ${readyClient.user.tag} in ${readyClient.guilds.cache.size} server(s)`);
-});
+function trackedAsyncHandler<Args extends unknown[]>(
+  event: string,
+  handler: (...args: Args) => Promise<void> | void,
+): (...args: Args) => void {
+  const safe = safeAsyncHandler(event, handler, log);
+  return (...args) => { void work.run(() => safe(...args)); };
+}
 
-client.on(Events.InteractionCreate, async (interaction) => {
+client.once(Events.ClientReady, trackedAsyncHandler("client_ready", async (readyClient) => {
+  const rest = new REST().setToken(config.token);
+  await rest.put(Routes.applicationCommands(readyClient.user.id), { body: [command.toJSON()] });
+  log("client_ready", { userTag: readyClient.user.tag, guildCount: readyClient.guilds.cache.size });
+}));
+
+client.on(Events.InteractionCreate, trackedAsyncHandler("interaction_create", async (interaction) => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== "monitor") return;
   await handleCommand(interaction).catch(async (error: unknown) => {
-    console.error(error);
+    log("command_failed", { error: error instanceof Error ? error.message : String(error) }, "error");
     const response = { content: "The setting could not be updated. Check the bot logs.", ephemeral: true } as const;
     if (interaction.replied || interaction.deferred) await interaction.followUp(response);
     else await interaction.reply(response);
   });
-});
+}));
 
-client.on(Events.MessageCreate, (message) => {
+client.on(Events.MessageCreate, trackedAsyncHandler("message_create", async (message) => {
   if (!message.guildId || !message.member || message.author.bot || message.webhookId) return;
   const guildId = message.guildId;
   if (message.member.permissions.has(PermissionFlagsBits.Administrator)) return;
@@ -181,49 +235,66 @@ client.on(Events.MessageCreate, (message) => {
   if (included.length && !included.includes(message.channelId)) return;
   if (store.listRules(guildId, "exclude_channel").includes(message.channelId)) return;
 
-  const config = store.getConfig(guildId);
+  const guildConfig = store.getConfig(guildId);
   const reasons = detectReasons(message.content, store.listRules(guildId, "keyword"), store.listRules(guildId, "domain"), store.listRules(guildId, "pattern"));
-  if (config.mode === "matching" && !reasons.length) return;
-  store.save({
-    message_id: message.id,
-    guild_id: guildId,
-    channel_id: message.channelId,
-    author_id: message.author.id,
-    author_tag: message.author.tag,
+  if (guildConfig.mode === "matching" && !reasons.length) return;
+  const sources = message.attachments.map((attachment) => ({
+    id: attachment.id,
+    url: attachment.url,
+    name: attachment.name,
+    contentType: attachment.contentType,
+    size: attachment.size,
+  }));
+  await coordinator.capture({
+    messageId: message.id,
+    guildId,
+    channelId: message.channelId,
+    authorId: message.author.id,
+    authorTag: message.author.tag,
     content: message.content,
-    attachment_urls: JSON.stringify(message.attachments.map((attachment) => attachment.url)),
-    matched_reasons: JSON.stringify(reasons),
-    created_at: message.createdAt.toISOString(),
+    createdAt: message.createdAt,
+    reasons,
+    attachments: sources,
   });
-});
+}));
 
-client.on(Events.MessageDelete, async (message) => {
+client.on(Events.MessageDelete, trackedAsyncHandler("message_delete", async (message) => {
   if (!message.guildId) return;
-  const saved = store.get(message.id);
-  if (!saved) return;
-  const reviewChannelId = store.getConfig(message.guildId).review_channel_id;
-  if (reviewChannelId) {
-    const channel = await client.channels.fetch(reviewChannelId).catch(() => null);
-    if (channel?.isSendable()) {
-      const attachments = JSON.parse(saved.attachment_urls) as string[];
-      const reasons = JSON.parse(saved.matched_reasons) as string[];
-      await channel.send({ allowedMentions: { parse: [] }, content: [
-        "**Deleted message captured**",
-        `Author: ${saved.author_tag} (\`${saved.author_id}\`)`,
-        `Channel: <#${saved.channel_id}>`,
-        `Posted: <t:${Math.floor(new Date(saved.created_at).getTime() / 1000)}:F>`,
-        reasons.length ? `Matched: ${reasons.join(", ")}` : "Matched: all-message mode",
-        `Content:\n${saved.content || "*(no text content)*"}`,
-        attachments.length ? `Attachments: ${attachments.join(" ")}` : "",
-      ].filter(Boolean).join("\n") });
+  await coordinator.afterCapture(message.id, async () => {
+    if (!store.markDeleted(message.id)) return;
+    await deliver(message.guildId!, message.id);
+  });
+}));
+
+const purgeTimer = setInterval(() => {
+  void work.run(() => {
+    try {
+      const removed = store.purgeExpired(new Date());
+      if (removed) log("evidence_purged", { count: removed });
+    } catch (error) {
+      log("purge_failed", { error: error instanceof Error ? error.message : String(error) }, "error");
     }
-  }
-  store.remove(message.id);
+  });
+}, 15 * 60 * 1000);
+purgeTimer.unref();
+const stopBackgroundWork = () => {
+  clearInterval(purgeTimer);
+  retryWorker.stop();
+  coordinator.stop();
+};
+installGracefulShutdown(client, store, log, process, stopBackgroundWork, {
+  work,
+  drainTimeoutMs: config.shutdownDrainTimeoutMs,
 });
 
-setInterval(() => {
-  const removed = store.purgeExpired(new Date());
-  if (removed) console.log(`Purged ${removed} expired message snapshot(s)`);
-}, 15 * 60 * 1000).unref();
-
-await client.login(token);
+try {
+  await client.login(config.token);
+  retryWorker.start();
+} catch (error) {
+  work.stopAccepting();
+  stopBackgroundWork();
+  await work.drain(config.shutdownDrainTimeoutMs);
+  store.close();
+  log("login_failed", { error: error instanceof Error ? error.message : String(error) }, "error");
+  process.exitCode = 1;
+}
