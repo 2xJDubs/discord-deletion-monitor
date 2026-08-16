@@ -29,6 +29,21 @@ The `/monitor` command requires `Manage Server`. Configuration and cached eviden
 
 In `matching` mode, **every message containing a link is cached automatically**, even if the domain is not explicitly listed. Configured keywords, domains, and built-in patterns add further reasons to save a message. Members with Discord's Administrator permission and members with any excluded role are ignored before detection runs.
 
-Messages appear in the review channel only if they are deleted. Undeleted cached messages are purged after the per-server retention period. Copied text uses disabled mentions.
+Messages appear in the review channel only if they are deleted. Evidence remains in SQLite until every Discord payload succeeds or retention expires; missing channels and transient failures are retried with persisted exponential backoff, including after process restarts. Atomic delivery leases prevent duplicate immediate/retry workers, and completed payload-batch progress is persisted so partial retries resume without reposting earlier batches. Undeleted cached messages are purged after the per-server retention period. Copied text has Markdown and mention syntax neutralized. Content that would exceed Discord's 2,000-character limit is delivered as a UTF-8 text attachment, and files are split into Discord-safe batches of ten.
 
-Attachment URLs may expire after deletion. A production deployment should download attachment bytes at message creation and apply a documented retention policy.
+Attachment bytes are downloaded at message creation and stored durably in SQLite. Per-message limits, a bounded global capture queue, and `STORED_ATTACHMENT_MAX_BYTES` constrain memory and disk use; queue overflow still saves message text. Failed or aborted downloads are logged without dropping the message text. Stored attachment rows are cascade-deleted when evidence is delivered or expires.
+
+## Operations
+
+Build before invoking the online-backup CLI. It accepts a destination directory and creates a timestamped `.db` file there while the bot can remain online:
+
+```sh
+pnpm build
+node dist/backup.js /var/backups/discord-deletion-monitor
+# equivalent package script:
+pnpm backup -- /var/backups/discord-deletion-monitor
+```
+
+SQLite runs with foreign keys enabled, WAL mode, and a configurable busy timeout (`DATABASE_BUSY_TIMEOUT_MS`). `SIGINT` and `SIGTERM` stop accepting work, stop retry/purge timers, abort downloads, drain active handlers within `SHUTDOWN_DRAIN_TIMEOUT_MS`, destroy Discord, checkpoint WAL, and close SQLite exactly once. Logs are single-line JSON; set `LOG_LEVEL` to `debug`, `info`, `warn`, or `error`.
+
+For the hardened `systemd` deployment, daily backup timer, install/update scripts, restore drill, and LXC guidance, see [`deploy/README.md`](deploy/README.md). Data handling and retention are documented in [`docs/data-retention.md`](docs/data-retention.md).

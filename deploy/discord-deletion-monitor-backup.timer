@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily backup for Discord Deletion Monitor
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=discord-deletion-monitor-backup.service
+
+[Install]
+WantedBy=timers.target

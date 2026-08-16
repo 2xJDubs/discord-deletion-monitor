@@ -6,10 +6,12 @@
   "description": "A multi-server Discord bot that preserves deleted messages for moderator review.",
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "backup": "node dist/backup.js"
   },
   "engines": {
     "node": ">=20"
@@ -23,6 +25,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.1.0",
     "tsx": "^4.20.3",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.10"
   }
 }

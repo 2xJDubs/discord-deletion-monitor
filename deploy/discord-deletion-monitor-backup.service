@@ -1,0 +1,40 @@
+[Unit]
+Description=Back up Discord Deletion Monitor SQLite database
+RequiresMountsFor=/var/lib/discord-deletion-monitor /var/backups/discord-deletion-monitor
+
+[Service]
+Type=oneshot
+User=discord-monitor
+Group=discord-monitor
+WorkingDirectory=/opt/discord-deletion-monitor/current
+EnvironmentFile=/etc/discord-deletion-monitor-backup.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node /opt/discord-deletion-monitor/current/dist/backup.js /var/backups/discord-deletion-monitor
+ExecStartPost=/usr/bin/find /var/backups/discord-deletion-monitor -type f -name *.db -mtime +14 -delete
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+RemoveIPC=true
+SystemCallArchitectures=native
+LockPersonality=true
+MemoryDenyWriteExecute=false
+MemoryMax=128M
+TasksMax=32
+LimitNOFILE=256
+ReadWritePaths=/var/lib/discord-deletion-monitor /var/backups/discord-deletion-monitor
