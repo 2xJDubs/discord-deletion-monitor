@@ -27,9 +27,18 @@ command -v pnpm >/dev/null || { echo "pnpm 11.19.0 is required." >&2; exit 1; }
 command -v flock >/dev/null || { echo "flock is required." >&2; exit 1; }
 command -v pgrep >/dev/null || { echo "pgrep is required." >&2; exit 1; }
 command -v pkill >/dev/null || { echo "pkill is required." >&2; exit 1; }
+command -v git >/dev/null || { echo "git is required." >&2; exit 1; }
+command -v sha256sum >/dev/null || { echo "sha256sum is required." >&2; exit 1; }
+command -v od >/dev/null || { echo "od is required." >&2; exit 1; }
+command -v find >/dev/null || { echo "find is required." >&2; exit 1; }
+command -v sort >/dev/null || { echo "sort is required." >&2; exit 1; }
 NODE_MAJOR=$(node -p "Number(process.versions.node.split('.')[0])")
 (( NODE_MAJOR >= 20 )) || { echo "Node.js 20+ is required." >&2; exit 1; }
 [[ $(pnpm --version) == 11.19.0 ]] || { echo "pnpm 11.19.0 is required." >&2; exit 1; }
+GIT_COMMIT=$(git -C "$SOURCE_DIR" rev-parse --verify HEAD) || {
+  echo "The source must be a Git checkout with a resolvable HEAD." >&2
+  exit 1
+}
 
 INSTALL_LOCK=/run/lock/discord-deletion-monitor-install.lock
 exec {INSTALL_LOCK_FD}>"$INSTALL_LOCK"
@@ -117,11 +126,29 @@ RELEASE_DIR=$RELEASES_DIR/$RELEASE_ID
 install -d -o root -g root -m 0755 "$RELEASE_DIR"
 cp -a "$STAGE/dist" "$STAGE/node_modules" "$RELEASE_DIR/"
 install -o root -g root -m 0644 "$STAGE/package.json" "$STAGE/pnpm-lock.yaml" "$RELEASE_DIR/"
+write_release_metadata "$RELEASE_DIR" "$GIT_COMMIT" "$STAGE/pnpm-lock.yaml"
 chown -R root:root "$RELEASE_DIR"
 find "$RELEASE_DIR" -type d -exec chmod go-w {} +
 find "$RELEASE_DIR" -type f -exec chmod go-w {} +
 
 PREVIOUS_RELEASE=$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)
+
+run_staged_online_backup() {
+  local destination=$1
+  if [[ ! -f $RELEASE_DIR/dist/backup.js ]]; then
+    echo "The built release has no backup CLI; refusing activation." >&2
+    return 1
+  fi
+  runuser -u "$SERVICE_USER" -- env \
+    PATH="$SAFE_PATH" \
+    DATABASE_PATH="$DATA_DIR/messages.db" \
+    node "$RELEASE_DIR/dist/backup.js" "$destination"
+}
+
+# Never activate new application code over an existing database until the
+# already-built and tested release has produced and validated a new online
+# backup using its non-migrating source-open path.
+require_verified_online_backup "$DATA_DIR/messages.db" "$BACKUP_DIR" run_staged_online_backup
 
 UNIT_NAMES=(
   discord-deletion-monitor.service
@@ -207,12 +234,14 @@ install -o root -g root -m 0644 "$SOURCE_DIR/deploy/discord-deletion-monitor-bac
 install -o root -g root -m 0644 "$SOURCE_DIR/deploy/discord-deletion-monitor-backup.timer" /etc/systemd/system/
 
 if [[ ! -e "$ENV_FILE" ]]; then
-  install -o root -g "$SERVICE_USER" -m 0640 "$SOURCE_DIR/deploy/discord-deletion-monitor.env.example" "$ENV_FILE"
+  install -o root -g root -m 0600 "$SOURCE_DIR/deploy/discord-deletion-monitor.env.example" "$ENV_FILE"
   echo "Created $ENV_FILE. Set DISCORD_TOKEN before starting the service."
 fi
+secure_secret_file "$ENV_FILE"
 if [[ ! -e "$BACKUP_ENV_FILE" ]]; then
-  install -o root -g "$SERVICE_USER" -m 0640 "$SOURCE_DIR/deploy/discord-deletion-monitor-backup.env.example" "$BACKUP_ENV_FILE"
+  install -o root -g root -m 0600 "$SOURCE_DIR/deploy/discord-deletion-monitor-backup.env.example" "$BACKUP_ENV_FILE"
 fi
+secure_secret_file "$BACKUP_ENV_FILE"
 
 systemctl daemon-reload
 systemctl enable discord-deletion-monitor.service discord-deletion-monitor-backup.timer

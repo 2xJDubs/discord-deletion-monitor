@@ -27,6 +27,28 @@ describe("CaptureCoordinator", () => {
     expect(save).toHaveBeenCalledBefore(deliver);
   });
 
+  it("serializes same-message captures so deletion waits for every authoritative update", async () => {
+    const older = deferred<[]>();
+    const rows = new Set<string>();
+    const save = vi.fn((item: { message_id: string }) => { rows.add(item.message_id); });
+    const download = vi.fn()
+      .mockImplementationOnce(async () => older.promise)
+      .mockResolvedValueOnce([]);
+    const coordinator = new CaptureCoordinator({ save }, download, { concurrency: 2, maxQueued: 2 });
+
+    const first = coordinator.capture(snapshot("m1"));
+    const second = coordinator.capture({ ...snapshot("m1"), content: "newer" });
+    const deletion = coordinator.afterCapture("m1", () => { rows.delete("m1"); });
+    await Promise.resolve();
+
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(rows.has("m1")).toBe(false);
+    older.resolve([]);
+    await Promise.all([first, second, deletion]);
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(rows.has("m1")).toBe(false);
+  });
+
   it("bounds global capture concurrency and saves text on queue overflow", async () => {
     const gates = [deferred<[]>(), deferred<[]>()];
     let active = 0;

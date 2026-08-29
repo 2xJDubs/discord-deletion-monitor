@@ -22,20 +22,25 @@ export class CaptureCoordinator {
 
   capture(snapshot: MessageSnapshot): Promise<boolean> {
     if (!this.accepting) return Promise.resolve(false);
-    let task: Promise<boolean>;
-    if (this.active < this.limits.concurrency) {
-      task = this.run(snapshot);
-    } else if (this.queue.length < this.limits.maxQueued) {
-      task = new Promise<boolean>((resolve, reject) => this.queue.push({ snapshot, resolve, reject }));
-    } else {
-      task = this.saveTextOnly(snapshot);
-    }
+    const previous = this.inFlight.get(snapshot.messageId);
+    const task = previous
+      ? previous.catch(() => false).then(() => this.schedule(snapshot))
+      : this.schedule(snapshot);
     this.inFlight.set(snapshot.messageId, task);
     const cleanup = () => {
       if (this.inFlight.get(snapshot.messageId) === task) this.inFlight.delete(snapshot.messageId);
     };
     task.then(cleanup, cleanup);
     return task;
+  }
+
+  private schedule(snapshot: MessageSnapshot): Promise<boolean> {
+    if (!this.accepting) return Promise.resolve(false);
+    if (this.active < this.limits.concurrency) return this.run(snapshot);
+    if (this.queue.length < this.limits.maxQueued) {
+      return new Promise<boolean>((resolve, reject) => this.queue.push({ snapshot, resolve, reject }));
+    }
+    return this.saveTextOnly(snapshot);
   }
 
   async afterCapture<T>(messageId: string, action: () => Promise<T> | T): Promise<T> {

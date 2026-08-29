@@ -80,6 +80,7 @@ describe("deliverEvidence", () => {
       getConfig: vi.fn(() => ({ review_channel_id: reviewChannelId })),
       removeClaimed: vi.fn(() => true),
       renewDeliveryClaim: vi.fn<(messageId: string, token: string, now: Date, leaseMs: number) => boolean>(() => true),
+      isClaimDeliverable: vi.fn(() => true),
       advanceDeliveryBatch: vi.fn(() => true),
       scheduleRetry: vi.fn(),
     };
@@ -209,5 +210,31 @@ describe("deliverEvidence", () => {
     expect(ctx.send).toHaveBeenCalledTimes(1);
     expect(ctx.store.advanceDeliveryBatch).toHaveBeenCalledWith("m1", "claim-b", 2);
     expect(ctx.store.removeClaimed).toHaveBeenCalledWith("m1", "claim-b");
+  });
+
+  it("aborts before any irreversible send once retention/ownership is lost", async () => {
+    const ctx = setup();
+    ctx.store.isClaimDeliverable.mockReturnValue(false);
+    await expect(deliverEvidence("g1", "m1", "claim-a", ctx.store, ctx.fetchChannel, ctx.log)).resolves.toBe(false);
+    expect(ctx.send).not.toHaveBeenCalled();
+    expect(ctx.store.removeClaimed).not.toHaveBeenCalled();
+    expect(ctx.store.scheduleRetry).not.toHaveBeenCalled();
+    expect(ctx.log).toHaveBeenCalledWith("evidence_delivery_fenced", expect.objectContaining({ guildId: "g1", messageId: "m1" }));
+  });
+
+  it("aborts mid-batch and does not log success once a fence check fails before send", async () => {
+    const ctx = setup();
+    const item = evidence("x".repeat(3000));
+    item.attachments = Array.from({ length: 11 }, (_, index) => ({
+      attachment_id: `a${index}`, message_id: "m1", filename: `${index}.txt`, content_type: "text/plain",
+      size: 1, source_url: "url", bytes: Buffer.from("x"),
+    }));
+    ctx.store.getEvidence.mockReturnValue(item);
+    ctx.store.isClaimDeliverable.mockReturnValueOnce(true).mockReturnValueOnce(false);
+    await expect(deliverEvidence("g1", "m1", "claim-a", ctx.store, ctx.fetchChannel, ctx.log)).resolves.toBe(false);
+    expect(ctx.send).toHaveBeenCalledTimes(1);
+    expect(ctx.store.removeClaimed).not.toHaveBeenCalled();
+    expect(ctx.store.scheduleRetry).not.toHaveBeenCalled();
+    expect(ctx.log).toHaveBeenCalledWith("evidence_delivery_fenced", expect.objectContaining({ guildId: "g1", messageId: "m1" }));
   });
 });

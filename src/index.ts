@@ -1,6 +1,5 @@
 import "dotenv/config";
 import {
-  ChannelType,
   ChatInputCommandInteraction,
   Client,
   Events,
@@ -8,9 +7,8 @@ import {
   PermissionFlagsBits,
   REST,
   Routes,
-  SlashCommandBuilder,
 } from "discord.js";
-import { MessageStore, MonitorMode, RuleKind } from "./database.js";
+import { MonitorMode, RuleKind } from "./database.js";
 import { BUILT_IN_PATTERNS, detectReasons, normalizeDomain } from "./detector.js";
 import { downloadAttachments } from "./attachments.js";
 import { CaptureCoordinator } from "./coordinator.js";
@@ -19,6 +17,10 @@ import { deliverWithClaim } from "./delivery-claim.js";
 import { deliverEvidence } from "./evidence.js";
 import { createDeliveryRetryWorker } from "./retry-worker.js";
 import { ActiveWorkTracker, createJsonLogger, installGracefulShutdown, safeAsyncHandler } from "./runtime.js";
+import { createGuildDeleteHandler, createMessageEventPolicy, type MonitorMessage } from "./message-policy.js";
+import { buildMonitorCommand, executeMonitorCommand, formatSettings } from "./monitor-command.js";
+import { MessageStore } from "./database.js";
+
 
 const config = loadConfig();
 const log = createJsonLogger(config.logLevel);
@@ -68,56 +70,36 @@ const retryWorker = createDeliveryRetryWorker({
   log,
 });
 
-const command = new SlashCommandBuilder()
-  .setName("monitor")
-  .setDescription("Configure deleted-message monitoring")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-  .addSubcommand((sub) => sub.setName("review-channel").setDescription("Set the private evidence channel")
-    .addChannelOption((option) => option.setName("channel").setDescription("Moderator review channel")
-      .addChannelTypes(ChannelType.GuildText).setRequired(true)))
-  .addSubcommand((sub) => sub.setName("retention").setDescription("Set how long matching messages remain cached")
-    .addIntegerOption((option) => option.setName("hours").setDescription("Hours to retain messages (1–2160)")
-      .setMinValue(1).setMaxValue(2160).setRequired(true)))
-  .addSubcommand((sub) => sub.setName("mode").setDescription("Choose whether to cache all messages or matches only")
-    .addStringOption((option) => option.setName("value").setDescription("Monitoring mode").setRequired(true)
-      .addChoices({ name: "Matching messages only", value: "matching" }, { name: "All messages", value: "all" })))
-  .addSubcommandGroup((group) => group.setName("keyword").setDescription("Manage watched phrases")
-    .addSubcommand((sub) => sub.setName("add").setDescription("Add a watched phrase")
-      .addStringOption((option) => option.setName("value").setDescription("Phrase").setRequired(true)))
-    .addSubcommand((sub) => sub.setName("remove").setDescription("Remove a watched phrase")
-      .addStringOption((option) => option.setName("value").setDescription("Phrase").setRequired(true))))
-  .addSubcommandGroup((group) => group.setName("domain").setDescription("Manage watched domains")
-    .addSubcommand((sub) => sub.setName("add").setDescription("Add a watched domain")
-      .addStringOption((option) => option.setName("value").setDescription("Domain, such as example.com").setRequired(true)))
-    .addSubcommand((sub) => sub.setName("remove").setDescription("Remove a watched domain")
-      .addStringOption((option) => option.setName("value").setDescription("Domain").setRequired(true))))
-  .addSubcommandGroup((group) => group.setName("pattern").setDescription("Manage built-in scam patterns")
-    .addSubcommand((sub) => sub.setName("add").setDescription("Enable a pattern")
-      .addStringOption((option) => option.setName("value").setDescription("Pattern").setRequired(true)
-        .addChoices(...Object.keys(BUILT_IN_PATTERNS).map((name) => ({ name, value: name })))))
-    .addSubcommand((sub) => sub.setName("remove").setDescription("Disable a pattern")
-      .addStringOption((option) => option.setName("value").setDescription("Pattern").setRequired(true)
-        .addChoices(...Object.keys(BUILT_IN_PATTERNS).map((name) => ({ name, value: name }))))))
-  .addSubcommandGroup((group) => group.setName("channel").setDescription("Manage monitored channel scope")
-    .addSubcommand((sub) => sub.setName("include").setDescription("Add a channel to the include list")
-      .addChannelOption((option) => option.setName("channel").setDescription("Channel").setRequired(true)))
-    .addSubcommand((sub) => sub.setName("exclude").setDescription("Exclude a channel")
-      .addChannelOption((option) => option.setName("channel").setDescription("Channel").setRequired(true)))
-    .addSubcommand((sub) => sub.setName("remove-include").setDescription("Remove a channel from the include list")
-      .addChannelOption((option) => option.setName("channel").setDescription("Channel").setRequired(true)))
-    .addSubcommand((sub) => sub.setName("remove-exclude").setDescription("Remove a channel exclusion")
-      .addChannelOption((option) => option.setName("channel").setDescription("Channel").setRequired(true))))
-  .addSubcommandGroup((group) => group.setName("role").setDescription("Manage trusted roles whose posts are ignored")
-    .addSubcommand((sub) => sub.setName("exclude").setDescription("Ignore messages from members with this role")
-      .addRoleOption((option) => option.setName("role").setDescription("Trusted/admin role").setRequired(true)))
-    .addSubcommand((sub) => sub.setName("remove-exclusion").setDescription("Stop ignoring this role")
-      .addRoleOption((option) => option.setName("role").setDescription("Role").setRequired(true))))
-  .addSubcommand((sub) => sub.setName("settings").setDescription("Show this server's monitoring settings"))
-  .addSubcommand((sub) => sub.setName("test").setDescription("Test text against the current detection rules")
-    .addStringOption((option) => option.setName("message").setDescription("Sample message").setRequired(true)));
+const command = buildMonitorCommand();
+const policy = createMessageEventPolicy({
+  store,
+  coordinator,
+  deliver,
+  log: (event, fields) => log(event, fields, "warn"),
+});
+const handleGuildDelete = createGuildDeleteHandler(store);
 
-function formatList(values: string[], format = (value: string) => value): string {
-  return values.length ? values.map(format).join(", ") : "none";
+function toMonitorMessage(message: {
+  id: string; guildId: string | null; channelId: string; content: string; createdAt: Date;
+  author: { id: string; tag: string; bot: boolean } | null; webhookId: string | null;
+  member: { permissions: { has(flag: bigint): boolean }; roles: { cache: Map<string, unknown> } } | null;
+  attachments: Iterable<{ id: string; url: string; name: string; contentType: string | null; size: number }>;
+  partial: boolean;
+  fetch?: () => Promise<unknown>;
+}): MonitorMessage {
+  const sources = [...message.attachments].map((attachment) => ({
+    id: attachment.id, url: attachment.url, name: attachment.name, contentType: attachment.contentType, size: attachment.size,
+  }));
+  return {
+    id: message.id, guildId: message.guildId, channelId: message.channelId, content: message.content,
+    createdAt: message.createdAt, author: message.author,
+    webhookId: message.webhookId,
+    administrator: message.member?.permissions.has(PermissionFlagsBits.Administrator) ?? false,
+    roleIds: message.member ? [...message.member.roles.cache].map(([id]) => id as string) : [],
+    attachments: sources,
+    partial: message.partial,
+    fetch: message.fetch ? async () => toMonitorMessage(await message.fetch!() as never) : undefined,
+  };
 }
 
 async function handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -125,47 +107,56 @@ async function handleCommand(interaction: ChatInputCommandInteraction): Promise<
   const guildId = interaction.guildId;
   const group = interaction.options.getSubcommandGroup(false);
   const subcommand = interaction.options.getSubcommand();
+  const path = group ? `${group} ${subcommand}` : subcommand;
 
-  if (!group && subcommand === "review-channel") {
-    const channel = interaction.options.getChannel("channel", true);
-    store.setReviewChannel(guildId, channel.id);
-    await interaction.reply({ content: `Review channel set to <#${channel.id}>.`, ephemeral: true });
+  if (path === "help" || path === "status" || path === "forget" || path === "administrators" || path === "attachments" || path === "review-channel") {
+    const values: Record<string, string | number | boolean | null | undefined> = {};
+    if (path === "help") values.topic = interaction.options.getString("topic", false);
+    if (path === "forget") values.confirm = interaction.options.getString("confirm", true);
+    if (path === "administrators" || path === "attachments") values.value = interaction.options.getString("value", true);
+    let reviewChannelPermissions: { viewChannel: boolean; sendMessages: boolean; attachFiles: boolean } | undefined;
+    let channel: { id: string } | undefined;
+    if (path === "review-channel") {
+      channel = interaction.options.getChannel("channel", true);
+      values.channelId = channel.id;
+      const me = interaction.guild?.members.me;
+      const permissions = me ? interaction.guild?.channels.cache.get(channel.id)?.permissionsFor(me) : undefined;
+      reviewChannelPermissions = {
+        viewChannel: permissions?.has(PermissionFlagsBits.ViewChannel) ?? false,
+        sendMessages: permissions?.has(PermissionFlagsBits.SendMessages) ?? false,
+        attachFiles: permissions?.has(PermissionFlagsBits.AttachFiles) ?? false,
+      };
+    }
+    const result = await executeMonitorCommand({ guildId, path, values, reviewChannelPermissions }, store);
+    await interaction.reply({ content: result.content, ephemeral: result.ephemeral });
     return;
   }
-  if (!group && subcommand === "retention") {
+  if (!group && path === "retention") {
     const hours = interaction.options.getInteger("hours", true);
     store.setRetention(guildId, hours);
     await interaction.reply({ content: `Matching messages will be retained for ${hours} hour(s).`, ephemeral: true });
     return;
   }
-  if (!group && subcommand === "mode") {
+  if (!group && path === "mode") {
     const mode = interaction.options.getString("value", true) as MonitorMode;
     store.setMode(guildId, mode);
     await interaction.reply({ content: `Monitoring mode set to **${mode}**.`, ephemeral: true });
     return;
   }
-  if (!group && subcommand === "test") {
+  if (!group && path === "test") {
     const message = interaction.options.getString("message", true);
     const reasons = detectReasons(message, store.listRules(guildId, "keyword"), store.listRules(guildId, "domain"), store.listRules(guildId, "pattern"));
     await interaction.reply({ content: reasons.length ? `Would be saved: ${reasons.join(", ")}` : "Would not be saved in matching mode.", ephemeral: true });
     return;
   }
-  if (!group && subcommand === "settings") {
-    const config = store.getConfig(guildId);
-    const line = (kind: RuleKind, format?: (value: string) => string) => formatList(store.listRules(guildId, kind), format);
-    await interaction.reply({ ephemeral: true, content: [
-      `Mode: **${config.mode}**`,
-      `Retention: **${config.retention_hours} hours**`,
-      `Review channel: ${config.review_channel_id ? `<#${config.review_channel_id}>` : "not configured"}`,
-      "Any link: **watched automatically**",
-      "Administrators: **ignored automatically**",
-      `Keywords: ${line("keyword")}`,
-      `Domains: ${line("domain")}`,
-      `Patterns: ${line("pattern")}`,
-      `Included channels: ${line("include_channel", (id) => `<#${id}>`)}`,
-      `Excluded channels: ${line("exclude_channel", (id) => `<#${id}>`)}`,
-      `Excluded roles: ${line("exclude_role", (id) => `<@&${id}>`)}`,
-    ].join("\n") });
+  if (!group && path === "settings") {
+    const guildConfig = store.getConfig(guildId);
+    const rules: Record<RuleKind, string[]> = {
+      keyword: store.listRules(guildId, "keyword"), domain: store.listRules(guildId, "domain"), pattern: store.listRules(guildId, "pattern"),
+      include_channel: store.listRules(guildId, "include_channel"), exclude_channel: store.listRules(guildId, "exclude_channel"),
+      exclude_role: store.listRules(guildId, "exclude_role"),
+    };
+    await interaction.reply({ ephemeral: true, content: formatSettings(guildConfig, rules) });
     return;
   }
 
@@ -227,43 +218,23 @@ client.on(Events.InteractionCreate, trackedAsyncHandler("interaction_create", as
 }));
 
 client.on(Events.MessageCreate, trackedAsyncHandler("message_create", async (message) => {
-  if (!message.guildId || !message.member || message.author.bot || message.webhookId) return;
-  const guildId = message.guildId;
-  if (message.member.permissions.has(PermissionFlagsBits.Administrator)) return;
-  if (store.listRules(guildId, "exclude_role").some((roleId) => message.member!.roles.cache.has(roleId))) return;
-  const included = store.listRules(guildId, "include_channel");
-  if (included.length && !included.includes(message.channelId)) return;
-  if (store.listRules(guildId, "exclude_channel").includes(message.channelId)) return;
+  await policy.create(toMonitorMessage(message as never));
+}));
 
-  const guildConfig = store.getConfig(guildId);
-  const reasons = detectReasons(message.content, store.listRules(guildId, "keyword"), store.listRules(guildId, "domain"), store.listRules(guildId, "pattern"));
-  if (guildConfig.mode === "matching" && !reasons.length) return;
-  const sources = message.attachments.map((attachment) => ({
-    id: attachment.id,
-    url: attachment.url,
-    name: attachment.name,
-    contentType: attachment.contentType,
-    size: attachment.size,
-  }));
-  await coordinator.capture({
-    messageId: message.id,
-    guildId,
-    channelId: message.channelId,
-    authorId: message.author.id,
-    authorTag: message.author.tag,
-    content: message.content,
-    createdAt: message.createdAt,
-    reasons,
-    attachments: sources,
-  });
+client.on(Events.MessageUpdate, trackedAsyncHandler("message_update", async (_oldMessage, newMessage) => {
+  await policy.update(toMonitorMessage(newMessage as never));
 }));
 
 client.on(Events.MessageDelete, trackedAsyncHandler("message_delete", async (message) => {
-  if (!message.guildId) return;
-  await coordinator.afterCapture(message.id, async () => {
-    if (!store.markDeleted(message.id)) return;
-    await deliver(message.guildId!, message.id);
-  });
+  await policy.delete({ id: message.id, guildId: message.guildId });
+}));
+
+client.on(Events.MessageBulkDelete, trackedAsyncHandler("message_bulk_delete", async (messages) => {
+  await policy.bulkDelete([...messages.values()].map((message) => ({ id: message.id, guildId: message.guildId })));
+}));
+
+client.on(Events.GuildDelete, trackedAsyncHandler("guild_delete", async (guild) => {
+  await handleGuildDelete({ id: guild.id, unavailable: !guild.available });
 }));
 
 const purgeTimer = setInterval(() => {
