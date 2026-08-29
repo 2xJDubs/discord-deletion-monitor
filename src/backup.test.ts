@@ -8,30 +8,42 @@ import { MessageStore } from "./database.js";
 
 describe("backup CLI helper", () => {
   it("creates a timestamped database in the requested destination directory and closes the source", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "backup-mocked-success-"));
+    const backups = join(directory, "backups");
     const backup = vi.fn(async () => undefined);
     const close = vi.fn();
-    const destination = await runBackup({
-      databasePath: "/data/messages.db",
-      destinationDirectory: "/backups",
-      now: new Date("2026-08-15T03:15:16.123Z"),
-      sourceStat: () => ({ isFile: () => true }),
-      openStore: () => ({ backup, close }),
-      validateBackup: () => undefined,
-      publishBackup: () => undefined,
-    });
-    expect(destination).toBe("/backups/discord-deletion-monitor-20260815T031516123Z.db");
-    expect(backup).toHaveBeenCalledWith(expect.stringMatching(/\/backups\/\.discord-deletion-monitor-20260815T031516123Z\.db\.tmp-/));
-    expect(close).toHaveBeenCalledTimes(1);
+    try {
+      const destination = await runBackup({
+        databasePath: "/data/messages.db",
+        destinationDirectory: backups,
+        now: new Date("2026-08-15T03:15:16.123Z"),
+        sourceStat: () => ({ isFile: () => true }),
+        openStore: () => ({ backup, close }),
+        validateBackup: () => undefined,
+        publishBackup: () => undefined,
+      });
+      expect(destination).toBe(join(backups, "discord-deletion-monitor-20260815T031516123Z.db"));
+      expect(backup).toHaveBeenCalledWith(expect.stringMatching(/\/backups\/\.discord-deletion-monitor-20260815T031516123Z\.db\.tmp-/));
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("closes the source database when backup fails", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "backup-mocked-failure-"));
+    const backups = join(directory, "backups");
     const close = vi.fn();
-    await expect(runBackup({
-      databasePath: "/data/messages.db", destinationDirectory: "/backups", now: new Date(),
-      sourceStat: () => ({ isFile: () => true }),
-      openStore: () => ({ backup: async () => { throw new Error("disk full"); }, close }),
-    })).rejects.toThrow("disk full");
-    expect(close).toHaveBeenCalledTimes(1);
+    try {
+      await expect(runBackup({
+        databasePath: "/data/messages.db", destinationDirectory: backups, now: new Date(),
+        sourceStat: () => ({ isFile: () => true }),
+        openStore: () => ({ backup: async () => { throw new Error("disk full"); }, close }),
+      })).rejects.toThrow("disk full");
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("rejects a missing destination directory", async () => {

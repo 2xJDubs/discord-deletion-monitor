@@ -55,7 +55,7 @@ Alternatively authenticate interactively with an already-installed official `gh`
 Enable Discord **Message Content Intent**, then from the trusted checkout:
 
 ```bash
-node --version                 # supported: >=20; production bootstrap uses 22 LTS
+node --version                 # supported: >=22.13; production bootstrap uses 22 LTS
 pnpm --version                 # exactly 11.19.0
 git diff --check
 bash -n deploy/*.sh

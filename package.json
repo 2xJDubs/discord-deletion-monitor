@@ -14,7 +14,7 @@
     "backup": "node dist/backup.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   },
   "dependencies": {
     "better-sqlite3": "^12.2.0",

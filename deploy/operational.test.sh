@@ -27,8 +27,16 @@ require '^StartLimitBurst=' deploy/discord-deletion-monitor.service \
   'service must define a restart-rate burst'
 require '/usr/bin/find .* -daystart -mtime \+14 ' deploy/discord-deletion-monitor-backup.service \
   'backup cleanup must encode exact approximately 15-day calendar semantics'
-require 'node-version: \[20, 22\]' .github/workflows/ci.yml \
-  'CI must test Node 20 and Node 22'
+require 'node-version: \[22\]' .github/workflows/ci.yml \
+  'CI must use the Node 22 toolchain required by pnpm 11'
+require '"node": ">=22\.13"' package.json \
+  'package engine must match the minimum Node version required by pnpm 11'
+require '^[[:space:]]*- uses:[[:space:]]+actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1([[:space:]]+#.*)?$' .github/workflows/ci.yml \
+  'checkout must use the approved immutable Node 24-based release pin'
+require '^[[:space:]]*- uses:[[:space:]]+actions/setup-node@820762786026740c76f36085b0efc47a31fe5020([[:space:]]+#.*)?$' .github/workflows/ci.yml \
+  'setup-node must use the approved immutable Node 24-based release pin'
+require '^[[:space:]]*- uses:[[:space:]]+pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86([[:space:]]+#.*)?$' .github/workflows/ci.yml \
+  'pnpm setup must use the approved immutable Node 24-based release pin'
 require 'if: matrix.node-version == 22' .github/workflows/ci.yml \
   'expensive deployment validation must run once'
 require 'dist.*test' .github/workflows/ci.yml \
