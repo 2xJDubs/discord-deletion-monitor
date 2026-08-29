@@ -44,7 +44,7 @@ jobs:
           sudo apt-get install -y shellcheck
           bash -n deploy/install.sh deploy/install-lib.sh deploy/install-lib.test.sh deploy/operational.test.sh deploy/update.sh
           shellcheck deploy/install.sh deploy/install-lib.sh deploy/install-lib.test.sh deploy/operational.test.sh deploy/update.sh
-          bash deploy/install-lib.test.sh
+          sudo bash deploy/install-lib.test.sh
           bash deploy/operational.test.sh
           systemd-analyze verify \
             deploy/discord-deletion-monitor.service \

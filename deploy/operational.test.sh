@@ -37,6 +37,8 @@ require '^[[:space:]]*- uses:[[:space:]]+actions/setup-node@820762786026740c76f3
   'setup-node must use the approved immutable Node 24-based release pin'
 require '^[[:space:]]*- uses:[[:space:]]+pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86([[:space:]]+#.*)?$' .github/workflows/ci.yml \
   'pnpm setup must use the approved immutable Node 24-based release pin'
+require '^[[:space:]]*sudo bash deploy/install-lib\.test\.sh[[:space:]]*$' .github/workflows/ci.yml \
+  'CI must run root-ownership deployment tests with deployment privileges'
 require 'if: matrix.node-version == 22' .github/workflows/ci.yml \
   'expensive deployment validation must run once'
 require 'dist.*test' .github/workflows/ci.yml \
