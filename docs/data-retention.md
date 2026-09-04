@@ -29,8 +29,10 @@ Operators can cap attachment downloads per file and per message, set a network t
 
 ## Backups
 
-Online SQLite backups contain the same sensitive evidence as the live database. The supplied timer retains local backups for 14 days. Proxmox or off-host backups should use an explicitly chosen retention period and equivalent access controls.
+Online SQLite backups contain the same sensitive evidence as the live database. The supplied daily timer deletes regular `*.db` files matching GNU `find -daystart -mtime +14`: age is measured from the start of today and `+14` means more than 14 complete rounded calendar-day buckets. This retains approximately 15 daily backups, with boundary timing sometimes retaining one extra. Proxmox or off-host backups should use an explicitly chosen retention period and equivalent access controls.
+
+With the default 1 GiB stored-attachment quota, the live database plus approximately 15 full daily backups can consume about 16 GiB before text, SQLite overhead, releases, the OS, logs, and free-space headroom. The production guide therefore recommends a 24 GiB disk (about 21 GiB expected capacity plus margin). Operators choosing an 8 GiB container must explicitly configure about three local backups and tested off-LXC copies; the installer does not silently reduce message or backup retention.
 
 ## Access and deletion
 
-Restrict the Discord review channel, LXC shell, SQLite database, and backups to trusted administrators. Removing a guild's configuration and evidence is currently an operator database task; stop the service and take a backup before manual maintenance.
+Restrict the Discord review channel, LXC shell, SQLite database, and backups to trusted administrators. Production environment files are `root:root` mode `0600`; systemd reads them before starting the unprivileged process. Removing a guild's configuration and evidence is currently an operator database task; stop the service and take a backup before manual maintenance.

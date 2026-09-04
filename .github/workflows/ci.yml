@@ -12,28 +12,45 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.19.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm audit --prod
+      - if: matrix.node-version == 22
+        run: pnpm audit --prod
       - run: pnpm test
       - run: pnpm typecheck
       - run: pnpm build
+      - name: Verify production build excludes tests
+        run: |
+          if find dist -type f \( -name '*.test.*' -o -name '*.spec.*' \) -print -quit | grep -q .; then
+            echo 'dist contains test artifacts' >&2
+            exit 1
+          fi
       - name: Validate deployment assets
+        if: matrix.node-version == 22
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          bash -n deploy/install.sh deploy/install-lib.sh deploy/install-lib.test.sh deploy/update.sh
-          shellcheck deploy/install.sh deploy/install-lib.sh deploy/install-lib.test.sh deploy/update.sh
-          bash deploy/install-lib.test.sh
+          bash -n deploy/install.sh deploy/install-lib.sh deploy/install-lib.test.sh deploy/operational.test.sh deploy/update.sh
+          shellcheck deploy/install.sh deploy/install-lib.sh deploy/install-lib.test.sh deploy/operational.test.sh deploy/update.sh
+          sudo bash deploy/install-lib.test.sh
+          bash deploy/operational.test.sh
           systemd-analyze verify \
             deploy/discord-deletion-monitor.service \
             deploy/discord-deletion-monitor-backup.service \
             deploy/discord-deletion-monitor-backup.timer
+          security_output=$(systemd-analyze security --offline=yes deploy/discord-deletion-monitor.service)
+          printf '%s\n' "$security_output"
+          score=$(awk '/Overall exposure level/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9]+$/) { print $i; exit } }' <<<"$security_output")
+          awk -v score="$score" 'BEGIN { exit !(score != "" && score <= 5.0) }'

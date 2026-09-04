@@ -14,6 +14,7 @@ type EvidenceStore = {
   getConfig(guildId: string): { review_channel_id: string | null };
   removeClaimed(messageId: string, claimToken: string): boolean;
   renewDeliveryClaim(messageId: string, claimToken: string, now?: Date, leaseMs?: number): boolean;
+  isClaimDeliverable(messageId: string, claimToken: string, now?: Date): boolean;
   advanceDeliveryBatch(messageId: string, claimToken: string, nextBatchIndex: number): boolean;
   scheduleRetry(messageId: string, error: unknown, now: Date, options: { claimToken: string }): boolean | void;
 };
@@ -134,6 +135,10 @@ export async function deliverEvidence(
     heartbeat.unref();
     for (let index = firstPendingBatch; index < payloads.length; index += 1) {
       if (!renewClaim()) throw new Error("delivery_claim_lost");
+      if (!store.isClaimDeliverable(messageId, claimToken, now())) {
+        log("evidence_delivery_fenced", { guildId, messageId, reason: "retention_or_ownership_lost" });
+        return false;
+      }
       await channel.send(payloads[index]);
       if (claimLost) throw new Error("delivery_claim_lost");
       if (!store.advanceDeliveryBatch(messageId, claimToken, index + 1)) throw new Error("delivery_claim_lost");

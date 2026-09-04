@@ -10,6 +10,8 @@ export type GuildConfig = {
   review_channel_id: string | null;
   retention_hours: number;
   mode: MonitorMode;
+  monitor_administrators: boolean;
+  monitor_attachments: boolean;
 };
 
 export type StoredMessage = {
@@ -43,6 +45,31 @@ export type StoredAttachment = {
 
 export type StoredEvidence = { message: StoredMessage; attachments: StoredAttachment[] };
 
+export type SaveResult = {
+  storedAttachments: number;
+  storedAttachmentBytes: number;
+  skippedAttachments: number;
+  skippedAttachmentBytes: number;
+};
+
+export type GuildStatus = {
+  storedMessages: number;
+  pendingMessages: number;
+  oldestPendingAt: string | null;
+  attachments: number;
+  attachmentBytes: number;
+  attachmentQuotaBytes: number;
+};
+
+export type DeleteGuildDataResult = {
+  messages: number;
+  attachments: number;
+  rules: number;
+  config: number;
+};
+
+export const DATABASE_SCHEMA_VERSION = 2;
+
 export class MessageStore {
   private readonly db: Database.Database;
   private readonly defaultRetentionHours: number;
@@ -57,12 +84,17 @@ export class MessageStore {
     this.db.pragma("foreign_keys = ON");
     this.db.pragma(`busy_timeout = ${options.busyTimeoutMs ?? 5000}`);
     this.db.pragma("journal_mode = WAL");
+    const schemaVersion = Number(this.db.pragma("user_version", { simple: true }));
+    if (schemaVersion > DATABASE_SCHEMA_VERSION) throw new Error(`Database schema version ${schemaVersion} is newer than supported version ${DATABASE_SCHEMA_VERSION}`);
+    this.db.transaction(() => {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS guild_config (
         guild_id TEXT PRIMARY KEY,
         review_channel_id TEXT,
         retention_hours INTEGER NOT NULL DEFAULT ${this.defaultRetentionHours},
-        mode TEXT NOT NULL DEFAULT 'matching' CHECK(mode IN ('all', 'matching'))
+        mode TEXT NOT NULL DEFAULT 'matching' CHECK(mode IN ('all', 'matching')),
+        monitor_administrators INTEGER NOT NULL DEFAULT 0 CHECK(monitor_administrators IN (0, 1)),
+        monitor_attachments INTEGER NOT NULL DEFAULT 0 CHECK(monitor_attachments IN (0, 1))
       );
       CREATE TABLE IF NOT EXISTS rules (
         guild_id TEXT NOT NULL,
@@ -104,6 +136,8 @@ export class MessageStore {
     this.migrateLegacyGuildConfig();
     this.ensureColumn("guild_config", "retention_hours", `INTEGER NOT NULL DEFAULT ${this.defaultRetentionHours}`);
     this.ensureColumn("guild_config", "mode", "TEXT NOT NULL DEFAULT 'matching'");
+    this.ensureColumn("guild_config", "monitor_administrators", "INTEGER NOT NULL DEFAULT 0 CHECK(monitor_administrators IN (0, 1))");
+    this.ensureColumn("guild_config", "monitor_attachments", "INTEGER NOT NULL DEFAULT 0 CHECK(monitor_attachments IN (0, 1))");
     this.ensureColumn("messages", "matched_reasons", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn("messages", "deleted_at", "TEXT");
     this.ensureColumn("messages", "delivery_attempts", "INTEGER NOT NULL DEFAULT 0");
@@ -113,11 +147,18 @@ export class MessageStore {
     this.ensureColumn("messages", "delivery_claimed_until", "TEXT");
     this.ensureColumn("messages", "delivery_batch_index", "INTEGER NOT NULL DEFAULT 0");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_due ON messages(next_attempt_at, delivery_claimed_until, deleted_at)");
+    if (schemaVersion < DATABASE_SCHEMA_VERSION) this.db.pragma(`user_version = ${DATABASE_SCHEMA_VERSION}`);
+    })();
   }
 
   private migrateLegacyGuildConfig(): void {
     const columns = this.db.prepare("PRAGMA table_info(guild_config)").all() as Array<{ name: string; notnull: number }>;
     if (!columns.some((entry) => entry.name === "review_channel_id" && entry.notnull === 1)) return;
+    const names = new Set(columns.map((entry) => entry.name));
+    const retention = names.has("retention_hours") ? "retention_hours" : String(this.defaultRetentionHours);
+    const mode = names.has("mode") ? "CASE WHEN mode IN ('all', 'matching') THEN mode ELSE 'matching' END" : "'matching'";
+    const monitorAdministrators = names.has("monitor_administrators") ? "CASE WHEN monitor_administrators = 1 THEN 1 ELSE 0 END" : "0";
+    const monitorAttachments = names.has("monitor_attachments") ? "CASE WHEN monitor_attachments = 1 THEN 1 ELSE 0 END" : "0";
     this.db.transaction(() => {
       this.db.exec(`
         ALTER TABLE guild_config RENAME TO guild_config_legacy;
@@ -125,10 +166,12 @@ export class MessageStore {
           guild_id TEXT PRIMARY KEY,
           review_channel_id TEXT,
           retention_hours INTEGER NOT NULL DEFAULT ${this.defaultRetentionHours},
-          mode TEXT NOT NULL DEFAULT 'matching' CHECK(mode IN ('all', 'matching'))
+          mode TEXT NOT NULL DEFAULT 'matching' CHECK(mode IN ('all', 'matching')),
+          monitor_administrators INTEGER NOT NULL DEFAULT 0 CHECK(monitor_administrators IN (0, 1)),
+          monitor_attachments INTEGER NOT NULL DEFAULT 0 CHECK(monitor_attachments IN (0, 1))
         );
-        INSERT INTO guild_config (guild_id, review_channel_id)
-        SELECT guild_id, review_channel_id FROM guild_config_legacy;
+        INSERT INTO guild_config (guild_id, review_channel_id, retention_hours, mode, monitor_administrators, monitor_attachments)
+        SELECT guild_id, review_channel_id, ${retention}, ${mode}, ${monitorAdministrators}, ${monitorAttachments} FROM guild_config_legacy;
         DROP TABLE guild_config_legacy;
       `);
     })();
@@ -143,8 +186,8 @@ export class MessageStore {
     this.db.prepare("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)").run(guildId);
   }
 
-  save(message: StoredMessage, attachments: StoredAttachment[] = []): void {
-    this.db.transaction(() => {
+  save(message: StoredMessage, attachments: StoredAttachment[] = []): SaveResult {
+    return this.db.transaction(() => {
       this.db.prepare(`INSERT INTO messages
         (message_id, guild_id, channel_id, author_id, author_tag, content, attachment_urls, matched_reasons, created_at)
         VALUES (@message_id, @guild_id, @channel_id, @author_id, @author_tag, @content, @attachment_urls, @matched_reasons, @created_at)
@@ -156,11 +199,22 @@ export class MessageStore {
       const insert = this.db.prepare(`INSERT INTO attachments
         (attachment_id, message_id, filename, content_type, size, source_url, bytes)
         VALUES (@attachment_id, @message_id, @filename, @content_type, @size, @source_url, @bytes)`);
+      let storedAttachments = 0;
+      let storedAttachmentBytes = 0;
+      let skippedAttachments = 0;
+      let skippedAttachmentBytes = 0;
       for (const attachment of attachments) {
-        if (storedBytes + attachment.bytes.length > this.attachmentQuotaBytes) continue;
+        if (storedBytes + attachment.bytes.length > this.attachmentQuotaBytes) {
+          skippedAttachments += 1;
+          skippedAttachmentBytes += attachment.bytes.length;
+          continue;
+        }
         insert.run(attachment);
         storedBytes += attachment.bytes.length;
+        storedAttachments += 1;
+        storedAttachmentBytes += attachment.bytes.length;
       }
+      return { storedAttachments, storedAttachmentBytes, skippedAttachments, skippedAttachmentBytes };
     })();
   }
 
@@ -201,16 +255,31 @@ export class MessageStore {
     return this.db.prepare(`UPDATE messages
       SET delivery_claim_token = ?, delivery_claimed_until = ?
       WHERE message_id = ? AND deleted_at IS NOT NULL AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?
+        AND julianday(COALESCE(deleted_at, created_at)) > julianday(?) - (COALESCE(
+          (SELECT retention_hours FROM guild_config WHERE guild_id = messages.guild_id), ?
+        ) / 24.0)
         AND (delivery_claimed_until IS NULL OR delivery_claimed_until <= ?)`)
-      .run(token, claimedUntil, messageId, timestamp, timestamp).changes === 1;
+      .run(token, claimedUntil, messageId, timestamp, timestamp, this.defaultRetentionHours, timestamp).changes === 1;
   }
 
   renewDeliveryClaim(messageId: string, token: string, now: Date = new Date(), leaseMs = 60_000): boolean {
     const timestamp = now.toISOString();
     const claimedUntil = new Date(now.getTime() + Math.max(1, leaseMs)).toISOString();
     return this.db.prepare(`UPDATE messages SET delivery_claimed_until = ?
-      WHERE message_id = ? AND delivery_claim_token = ? AND delivery_claimed_until > ?`)
-      .run(claimedUntil, messageId, token, timestamp).changes === 1;
+      WHERE message_id = ? AND delivery_claim_token = ? AND delivery_claimed_until > ?
+        AND julianday(COALESCE(deleted_at, created_at)) > julianday(?) - (COALESCE(
+          (SELECT retention_hours FROM guild_config WHERE guild_id = messages.guild_id), ?
+        ) / 24.0)`)
+      .run(claimedUntil, messageId, token, timestamp, timestamp, this.defaultRetentionHours).changes === 1;
+  }
+
+  isClaimDeliverable(messageId: string, token: string, now: Date = new Date()): boolean {
+    const timestamp = now.toISOString();
+    return this.db.prepare(`SELECT 1 FROM messages
+      WHERE message_id = ? AND delivery_claim_token = ? AND delivery_claimed_until > ?
+        AND julianday(COALESCE(deleted_at, created_at)) > julianday(?) - (COALESCE(
+          (SELECT retention_hours FROM guild_config WHERE guild_id = messages.guild_id), ?
+        ) / 24.0)`).get(messageId, token, timestamp, timestamp, this.defaultRetentionHours) !== undefined;
   }
 
   advanceDeliveryBatch(messageId: string, token: string, nextBatchIndex: number): boolean {
@@ -242,14 +311,15 @@ export class MessageStore {
 
   purgeExpired(now: Date): number {
     return this.db.prepare(`DELETE FROM messages
-      WHERE julianday(COALESCE(deleted_at, created_at)) < julianday(?) - (COALESCE(
+      WHERE julianday(COALESCE(deleted_at, created_at)) <= julianday(?) - (COALESCE(
         (SELECT retention_hours FROM guild_config WHERE guild_id = messages.guild_id), ?
       ) / 24.0)`).run(now.toISOString(), this.defaultRetentionHours).changes;
   }
 
   getConfig(guildId: string): GuildConfig {
     this.ensureGuild(guildId);
-    return this.db.prepare("SELECT * FROM guild_config WHERE guild_id = ?").get(guildId) as GuildConfig;
+    const row = this.db.prepare("SELECT * FROM guild_config WHERE guild_id = ?").get(guildId) as Omit<GuildConfig, "monitor_administrators" | "monitor_attachments"> & { monitor_administrators: number; monitor_attachments: number };
+    return { ...row, monitor_administrators: row.monitor_administrators === 1, monitor_attachments: row.monitor_attachments === 1 };
   }
 
   setReviewChannel(guildId: string, channelId: string): void {
@@ -265,6 +335,16 @@ export class MessageStore {
   setMode(guildId: string, mode: MonitorMode): void {
     this.ensureGuild(guildId);
     this.db.prepare("UPDATE guild_config SET mode = ? WHERE guild_id = ?").run(mode, guildId);
+  }
+
+  setMonitorAdministrators(guildId: string, enabled: boolean): void {
+    this.ensureGuild(guildId);
+    this.db.prepare("UPDATE guild_config SET monitor_administrators = ? WHERE guild_id = ?").run(enabled ? 1 : 0, guildId);
+  }
+
+  setMonitorAttachments(guildId: string, enabled: boolean): void {
+    this.ensureGuild(guildId);
+    this.db.prepare("UPDATE guild_config SET monitor_attachments = ? WHERE guild_id = ?").run(enabled ? 1 : 0, guildId);
   }
 
   addRule(guildId: string, kind: RuleKind, value: string): boolean {
@@ -288,6 +368,37 @@ export class MessageStore {
     };
   }
 
+  getGuildStatus(guildId: string): GuildStatus {
+    const messageRow = this.db.prepare(`SELECT
+        COUNT(*) AS storedMessages,
+        SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) AS pendingMessages,
+        MIN(CASE WHEN deleted_at IS NOT NULL THEN deleted_at ELSE NULL END) AS oldestPendingAt
+      FROM messages WHERE guild_id = ?`).get(guildId) as { storedMessages: number; pendingMessages: number | null; oldestPendingAt: string | null };
+    const attachmentRow = this.db.prepare(`SELECT
+        COUNT(*) AS attachments,
+        COALESCE(SUM(LENGTH(a.bytes)), 0) AS attachmentBytes
+      FROM attachments a JOIN messages m ON m.message_id = a.message_id WHERE m.guild_id = ?`).get(guildId) as { attachments: number; attachmentBytes: number };
+    return {
+      storedMessages: messageRow.storedMessages,
+      pendingMessages: messageRow.pendingMessages ?? 0,
+      oldestPendingAt: messageRow.oldestPendingAt ?? null,
+      attachments: attachmentRow.attachments,
+      attachmentBytes: Number(attachmentRow.attachmentBytes),
+      attachmentQuotaBytes: this.attachmentQuotaBytes,
+    };
+  }
+
+  deleteGuildData(guildId: string): DeleteGuildDataResult {
+    return this.db.transaction(() => {
+      const attachments = this.db.prepare(`DELETE FROM attachments
+        WHERE message_id IN (SELECT message_id FROM messages WHERE guild_id = ?)`).run(guildId).changes;
+      const messages = this.db.prepare("DELETE FROM messages WHERE guild_id = ?").run(guildId).changes;
+      const rules = this.db.prepare("DELETE FROM rules WHERE guild_id = ?").run(guildId).changes;
+      const config = this.db.prepare("DELETE FROM guild_config WHERE guild_id = ?").run(guildId).changes;
+      return { messages, attachments, rules, config };
+    })();
+  }
+
   countAttachments(): number {
     return Number((this.db.prepare("SELECT COUNT(*) AS count FROM attachments").get() as { count: number }).count);
   }
@@ -303,5 +414,26 @@ export class MessageStore {
     this.db.close();
     this.closed = true;
     return true;
+  }
+}
+
+export type BackupSource = { backup(destination: string): Promise<void>; close(): void };
+
+/** Opens an existing source read-only; this path intentionally performs no schema migration or DDL. */
+export function openBackupSource(path: string, busyTimeoutMs = 5_000): BackupSource {
+  const db = new Database(path, { readonly: true, fileMustExist: true });
+  try {
+    db.pragma(`busy_timeout = ${busyTimeoutMs}`);
+    const version = Number(db.pragma("user_version", { simple: true }));
+    if (version > DATABASE_SCHEMA_VERSION) {
+      throw new Error(`Backup source schema version ${version} is newer than supported version ${DATABASE_SCHEMA_VERSION}`);
+    }
+    return {
+      backup: async (destination) => { await db.backup(destination); },
+      close: () => db.close(),
+    };
+  } catch (error) {
+    db.close();
+    throw error;
   }
 }

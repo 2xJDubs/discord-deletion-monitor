@@ -3,6 +3,8 @@ Description=Discord Deletion Monitor
 Documentation=https://github.com/2xJDubs/discord-deletion-monitor
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -28,6 +30,7 @@ ProtectProc=invisible
 ProcSubset=pid
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
@@ -39,6 +42,7 @@ AmbientCapabilities=
 RemoveIPC=true
 SystemCallArchitectures=native
 LockPersonality=true
+RestrictNamespaces=true
 MemoryDenyWriteExecute=false
 MemoryMax=512M
 TasksMax=64

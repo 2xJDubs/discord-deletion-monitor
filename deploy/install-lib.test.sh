@@ -103,4 +103,52 @@ restore_unit_active_state discord-deletion-monitor-backup.timer false || fail "t
 restore_unit_active_state discord-deletion-monitor-backup.timer true || fail "timer active state restoration failed"
 [[ $TIMER_ACTIVE == true ]] || fail "previously active timer was not restarted"
 
+SECRET_FILE=$TMP/secret.env
+printf '%s\n' 'DISCORD_TOKEN=secret' >"$SECRET_FILE"
+chmod 0666 "$SECRET_FILE"
+secure_secret_file "$SECRET_FILE" || fail "secret file hardening failed"
+[[ $(stat -c '%U:%G:%a' "$SECRET_FILE") == root:root:600 ]] || \
+  fail "secret file was not root:root mode 0600"
+
+mkdir -p "$TMP/release-metadata"
+printf '%s' 'lock data' >"$TMP/pnpm-lock.yaml"
+write_release_metadata "$TMP/release-metadata" deadbeef "$TMP/pnpm-lock.yaml" || \
+  fail "release metadata write failed"
+grep -qx 'git_commit=deadbeef' "$TMP/release-metadata/RELEASE-METADATA" || \
+  fail "release metadata omitted Git commit"
+EXPECTED_LOCK_HASH=$(sha256sum "$TMP/pnpm-lock.yaml" | cut -d ' ' -f 1)
+grep -qx "lockfile_sha256=$EXPECTED_LOCK_HASH" "$TMP/release-metadata/RELEASE-METADATA" || \
+  fail "release metadata omitted lockfile hash"
+[[ $(stat -c '%a' "$TMP/release-metadata/RELEASE-METADATA") == 644 ]] || \
+  fail "release metadata mode was not 0644"
+
+BACKUP_CALLS=0
+fake_online_backup() {
+  BACKUP_CALLS=$((BACKUP_CALLS + 1))
+  printf 'SQLite format 3\000payload' >"$1/new-backup.db"
+}
+mkdir -p "$TMP/backups"
+printf 'live database' >"$TMP/messages.db"
+require_verified_online_backup "$TMP/messages.db" "$TMP/backups" fake_online_backup || \
+  fail "new non-empty online backup was not accepted"
+[[ $BACKUP_CALLS == 1 ]] || fail "online backup command was not called once"
+
+BACKUP_CALLS=0
+require_verified_online_backup "$TMP/missing.db" "$TMP/backups" fake_online_backup || \
+  fail "missing database should not require a backup"
+[[ $BACKUP_CALLS == 0 ]] || fail "backup ran for a missing database"
+
+unchanged_backup() { :; }
+if require_verified_online_backup "$TMP/messages.db" "$TMP/backups" unchanged_backup 2>/dev/null; then
+  fail "backup verification accepted no newly created backup"
+fi
+empty_backup() { : >"$1/empty.db"; }
+if require_verified_online_backup "$TMP/messages.db" "$TMP/backups" empty_backup 2>/dev/null; then
+  fail "backup verification accepted an empty backup"
+fi
+invalid_backup() { printf 'not a sqlite database' >"$1/invalid.db"; }
+if require_verified_online_backup "$TMP/messages.db" "$TMP/backups" invalid_backup 2>/dev/null; then
+  fail "backup verification accepted a non-SQLite backup"
+fi
+
 printf '%s\n' "install-lib tests passed"

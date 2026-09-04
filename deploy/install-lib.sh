@@ -82,6 +82,69 @@ restore_unit_active_state() {
   fi
 }
 
+secure_secret_file() {
+  local path=$1
+  [[ -f $path && ! -L $path ]] || {
+    echo "Refusing to secure a missing, non-regular, or symlinked secret file: $path" >&2
+    return 1
+  }
+  chown root:root "$path"
+  chmod 0600 "$path"
+}
+
+write_release_metadata() {
+  local release=$1
+  local git_commit=$2
+  local lockfile=$3
+  local lockfile_sha256 temporary
+
+  lockfile_sha256=$(sha256sum "$lockfile" | cut -d ' ' -f 1) || return 1
+  temporary=$release/.RELEASE-METADATA.$$
+  printf 'git_commit=%s\nlockfile_sha256=%s\n' "$git_commit" "$lockfile_sha256" >"$temporary"
+  chmod 0644 "$temporary"
+  mv -f -- "$temporary" "$release/RELEASE-METADATA"
+}
+
+is_sqlite_database() {
+  local path=$1
+  local header
+  header=$(od -An -tx1 -N16 "$path" | tr -d '[:space:]') || return 1
+  [[ $header == 53514c69746520666f726d6174203300 ]]
+}
+
+require_verified_online_backup() {
+  local database=$1
+  local backup_dir=$2
+  local backup_function=$3
+  local before candidate found=false
+
+  [[ -e $database ]] || return 0
+  [[ -f $database && ! -L $database ]] || {
+    echo "Database exists but is not a regular, non-symlink file: $database" >&2
+    return 1
+  }
+  before=$(mktemp)
+  find "$backup_dir" -maxdepth 1 -type f -name '*.db' -printf '%p\n' | sort >"$before"
+  if ! "$backup_function" "$backup_dir"; then
+    rm -f -- "$before"
+    echo "Required online backup command failed." >&2
+    return 1
+  fi
+  while IFS= read -r candidate; do
+    if ! grep -Fqx -- "$candidate" "$before" && \
+      [[ -f $candidate && ! -L $candidate && -s $candidate ]] && \
+      is_sqlite_database "$candidate"; then
+      found=true
+      break
+    fi
+  done < <(find "$backup_dir" -maxdepth 1 -type f -name '*.db' -printf '%p\n' | sort)
+  rm -f -- "$before"
+  if [[ $found != true ]]; then
+    echo "Online backup did not create a new, non-empty regular .db file." >&2
+    return 1
+  fi
+}
+
 capture_journal_cursor() {
   local service=$1
   local output cursor
