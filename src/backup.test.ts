@@ -1,12 +1,40 @@
 import { describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runBackup } from "./backup.js";
+import { runBackup } from "./backup-core.js";
 import { MessageStore } from "./database.js";
 
 describe("backup CLI helper", () => {
+  it("creates a backup when backup.ts is invoked through a release symlink", () => {
+    const directory = mkdtempSync(join(tmpdir(), "backup-cli-symlink-"));
+    const source = join(directory, "messages.db");
+    const backups = join(directory, "backups");
+    const release = join(directory, "release");
+    const current = join(directory, "current");
+    const store = new MessageStore(source, 336);
+    store.close();
+    symlinkSync(join(process.cwd(), "src"), release);
+    symlinkSync(release, current);
+    try {
+      const result = spawnSync(
+        join(process.cwd(), "node_modules", ".bin", "tsx"),
+        [join(current, "backup.ts"), backups],
+        {
+          encoding: "utf8",
+          env: { ...process.env, DATABASE_PATH: source, DATABASE_BUSY_TIMEOUT_MS: "5000", LOG_LEVEL: "info" },
+        },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('"event":"backup_complete"');
+      expect(readdirSync(backups)).toHaveLength(1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("creates a timestamped database in the requested destination directory and closes the source", async () => {
     const directory = mkdtempSync(join(tmpdir(), "backup-mocked-success-"));
     const backups = join(directory, "backups");
