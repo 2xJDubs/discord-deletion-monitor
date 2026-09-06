@@ -8,8 +8,9 @@ export type RuleKind = "keyword" | "domain" | "pattern" | "include_channel" | "e
 export type GuildConfig = {
   guild_id: string;
   review_channel_id: string | null;
-  retention_hours: number;
+  retention_minutes: number;
   mode: MonitorMode;
+  monitoring_configured: boolean;
   monitor_administrators: boolean;
   monitor_attachments: boolean;
 };
@@ -68,17 +69,17 @@ export type DeleteGuildDataResult = {
   config: number;
 };
 
-export const DATABASE_SCHEMA_VERSION = 2;
+export const DATABASE_SCHEMA_VERSION = 4;
 
 export class MessageStore {
   private readonly db: Database.Database;
-  private readonly defaultRetentionHours: number;
+  private readonly defaultRetentionMinutes: number;
   private readonly attachmentQuotaBytes: number;
   private closed = false;
 
-  constructor(path: string, defaultRetentionHours: number, options: { busyTimeoutMs?: number; attachmentQuotaBytes?: number } = {}) {
+  constructor(path: string, defaultRetentionMinutes: number, options: { busyTimeoutMs?: number; attachmentQuotaBytes?: number } = {}) {
     mkdirSync(dirname(path), { recursive: true });
-    this.defaultRetentionHours = Math.max(1, Math.round(defaultRetentionHours));
+    this.defaultRetentionMinutes = Math.max(1, Math.round(defaultRetentionMinutes));
     this.attachmentQuotaBytes = options.attachmentQuotaBytes ?? Number.MAX_SAFE_INTEGER;
     this.db = new Database(path);
     this.db.pragma("foreign_keys = ON");
@@ -91,8 +92,9 @@ export class MessageStore {
       CREATE TABLE IF NOT EXISTS guild_config (
         guild_id TEXT PRIMARY KEY,
         review_channel_id TEXT,
-        retention_hours INTEGER NOT NULL DEFAULT ${this.defaultRetentionHours},
-        mode TEXT NOT NULL DEFAULT 'matching' CHECK(mode IN ('all', 'matching')),
+        retention_minutes INTEGER NOT NULL DEFAULT ${this.defaultRetentionMinutes},
+        mode TEXT NOT NULL DEFAULT 'all' CHECK(mode IN ('all', 'matching')),
+        monitoring_configured INTEGER NOT NULL DEFAULT 0 CHECK(monitoring_configured IN (0, 1)),
         monitor_administrators INTEGER NOT NULL DEFAULT 0 CHECK(monitor_administrators IN (0, 1)),
         monitor_attachments INTEGER NOT NULL DEFAULT 0 CHECK(monitor_attachments IN (0, 1))
       );
@@ -133,9 +135,10 @@ export class MessageStore {
       CREATE INDEX IF NOT EXISTS idx_messages_guild_created_at ON messages(guild_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_attachments_message_id ON attachments(message_id);
     `);
-    this.migrateLegacyGuildConfig();
-    this.ensureColumn("guild_config", "retention_hours", `INTEGER NOT NULL DEFAULT ${this.defaultRetentionHours}`);
-    this.ensureColumn("guild_config", "mode", "TEXT NOT NULL DEFAULT 'matching'");
+    this.migrateGuildConfig();
+    this.ensureColumn("guild_config", "retention_minutes", `INTEGER NOT NULL DEFAULT ${this.defaultRetentionMinutes}`);
+    this.ensureColumn("guild_config", "mode", "TEXT NOT NULL DEFAULT 'all'");
+    this.ensureColumn("guild_config", "monitoring_configured", "INTEGER NOT NULL DEFAULT 1 CHECK(monitoring_configured IN (0, 1))");
     this.ensureColumn("guild_config", "monitor_administrators", "INTEGER NOT NULL DEFAULT 0 CHECK(monitor_administrators IN (0, 1))");
     this.ensureColumn("guild_config", "monitor_attachments", "INTEGER NOT NULL DEFAULT 0 CHECK(monitor_attachments IN (0, 1))");
     this.ensureColumn("messages", "matched_reasons", "TEXT NOT NULL DEFAULT '[]'");
@@ -146,17 +149,25 @@ export class MessageStore {
     this.ensureColumn("messages", "delivery_claim_token", "TEXT");
     this.ensureColumn("messages", "delivery_claimed_until", "TEXT");
     this.ensureColumn("messages", "delivery_batch_index", "INTEGER NOT NULL DEFAULT 0");
+    this.db.exec(`INSERT OR IGNORE INTO guild_config (guild_id, monitoring_configured)
+      SELECT guild_id, 1 FROM rules UNION SELECT guild_id, 1 FROM messages`);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_due ON messages(next_attempt_at, delivery_claimed_until, deleted_at)");
     if (schemaVersion < DATABASE_SCHEMA_VERSION) this.db.pragma(`user_version = ${DATABASE_SCHEMA_VERSION}`);
     })();
   }
 
-  private migrateLegacyGuildConfig(): void {
+  private migrateGuildConfig(): void {
     const columns = this.db.prepare("PRAGMA table_info(guild_config)").all() as Array<{ name: string; notnull: number }>;
-    if (!columns.some((entry) => entry.name === "review_channel_id" && entry.notnull === 1)) return;
     const names = new Set(columns.map((entry) => entry.name));
-    const retention = names.has("retention_hours") ? "retention_hours" : String(this.defaultRetentionHours);
-    const mode = names.has("mode") ? "CASE WHEN mode IN ('all', 'matching') THEN mode ELSE 'matching' END" : "'matching'";
+    const reviewIsNullable = columns.some((entry) => entry.name === "review_channel_id" && entry.notnull === 0);
+    if (names.has("retention_minutes") && reviewIsNullable) return;
+    const retention = names.has("retention_minutes")
+      ? `CASE WHEN retention_minutes >= 1 THEN retention_minutes ELSE ${this.defaultRetentionMinutes} END`
+      : names.has("retention_hours")
+        ? `CASE WHEN retention_hours >= 1 THEN retention_hours * 60 ELSE ${this.defaultRetentionMinutes} END`
+        : String(this.defaultRetentionMinutes);
+    const mode = names.has("mode") ? "CASE WHEN mode IN ('all', 'matching') THEN mode ELSE 'all' END" : "'all'";
+    const monitoringConfigured = names.has("monitoring_configured") ? "CASE WHEN monitoring_configured = 1 THEN 1 ELSE 0 END" : "1";
     const monitorAdministrators = names.has("monitor_administrators") ? "CASE WHEN monitor_administrators = 1 THEN 1 ELSE 0 END" : "0";
     const monitorAttachments = names.has("monitor_attachments") ? "CASE WHEN monitor_attachments = 1 THEN 1 ELSE 0 END" : "0";
     this.db.transaction(() => {
@@ -165,13 +176,14 @@ export class MessageStore {
         CREATE TABLE guild_config (
           guild_id TEXT PRIMARY KEY,
           review_channel_id TEXT,
-          retention_hours INTEGER NOT NULL DEFAULT ${this.defaultRetentionHours},
-          mode TEXT NOT NULL DEFAULT 'matching' CHECK(mode IN ('all', 'matching')),
+          retention_minutes INTEGER NOT NULL DEFAULT ${this.defaultRetentionMinutes},
+          mode TEXT NOT NULL DEFAULT 'all' CHECK(mode IN ('all', 'matching')),
+          monitoring_configured INTEGER NOT NULL DEFAULT 0 CHECK(monitoring_configured IN (0, 1)),
           monitor_administrators INTEGER NOT NULL DEFAULT 0 CHECK(monitor_administrators IN (0, 1)),
           monitor_attachments INTEGER NOT NULL DEFAULT 0 CHECK(monitor_attachments IN (0, 1))
         );
-        INSERT INTO guild_config (guild_id, review_channel_id, retention_hours, mode, monitor_administrators, monitor_attachments)
-        SELECT guild_id, review_channel_id, ${retention}, ${mode}, ${monitorAdministrators}, ${monitorAttachments} FROM guild_config_legacy;
+        INSERT INTO guild_config (guild_id, review_channel_id, retention_minutes, mode, monitoring_configured, monitor_administrators, monitor_attachments)
+        SELECT guild_id, review_channel_id, ${retention}, ${mode}, ${monitoringConfigured}, ${monitorAdministrators}, ${monitorAttachments} FROM guild_config_legacy;
         DROP TABLE guild_config_legacy;
       `);
     })();
@@ -256,10 +268,10 @@ export class MessageStore {
       SET delivery_claim_token = ?, delivery_claimed_until = ?
       WHERE message_id = ? AND deleted_at IS NOT NULL AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?
         AND julianday(COALESCE(deleted_at, created_at)) > julianday(?) - (COALESCE(
-          (SELECT retention_hours FROM guild_config WHERE guild_id = messages.guild_id), ?
-        ) / 24.0)
+          (SELECT retention_minutes FROM guild_config WHERE guild_id = messages.guild_id), ?
+        ) / 1440.0)
         AND (delivery_claimed_until IS NULL OR delivery_claimed_until <= ?)`)
-      .run(token, claimedUntil, messageId, timestamp, timestamp, this.defaultRetentionHours, timestamp).changes === 1;
+      .run(token, claimedUntil, messageId, timestamp, timestamp, this.defaultRetentionMinutes, timestamp).changes === 1;
   }
 
   renewDeliveryClaim(messageId: string, token: string, now: Date = new Date(), leaseMs = 60_000): boolean {
@@ -268,9 +280,9 @@ export class MessageStore {
     return this.db.prepare(`UPDATE messages SET delivery_claimed_until = ?
       WHERE message_id = ? AND delivery_claim_token = ? AND delivery_claimed_until > ?
         AND julianday(COALESCE(deleted_at, created_at)) > julianday(?) - (COALESCE(
-          (SELECT retention_hours FROM guild_config WHERE guild_id = messages.guild_id), ?
-        ) / 24.0)`)
-      .run(claimedUntil, messageId, token, timestamp, timestamp, this.defaultRetentionHours).changes === 1;
+          (SELECT retention_minutes FROM guild_config WHERE guild_id = messages.guild_id), ?
+        ) / 1440.0)`)
+      .run(claimedUntil, messageId, token, timestamp, timestamp, this.defaultRetentionMinutes).changes === 1;
   }
 
   isClaimDeliverable(messageId: string, token: string, now: Date = new Date()): boolean {
@@ -278,8 +290,8 @@ export class MessageStore {
     return this.db.prepare(`SELECT 1 FROM messages
       WHERE message_id = ? AND delivery_claim_token = ? AND delivery_claimed_until > ?
         AND julianday(COALESCE(deleted_at, created_at)) > julianday(?) - (COALESCE(
-          (SELECT retention_hours FROM guild_config WHERE guild_id = messages.guild_id), ?
-        ) / 24.0)`).get(messageId, token, timestamp, timestamp, this.defaultRetentionHours) !== undefined;
+          (SELECT retention_minutes FROM guild_config WHERE guild_id = messages.guild_id), ?
+        ) / 1440.0)`).get(messageId, token, timestamp, timestamp, this.defaultRetentionMinutes) !== undefined;
   }
 
   advanceDeliveryBatch(messageId: string, token: string, nextBatchIndex: number): boolean {
@@ -312,14 +324,21 @@ export class MessageStore {
   purgeExpired(now: Date): number {
     return this.db.prepare(`DELETE FROM messages
       WHERE julianday(COALESCE(deleted_at, created_at)) <= julianday(?) - (COALESCE(
-        (SELECT retention_hours FROM guild_config WHERE guild_id = messages.guild_id), ?
-      ) / 24.0)`).run(now.toISOString(), this.defaultRetentionHours).changes;
+        (SELECT retention_minutes FROM guild_config WHERE guild_id = messages.guild_id), ?
+      ) / 1440.0)`).run(now.toISOString(), this.defaultRetentionMinutes).changes;
   }
 
   getConfig(guildId: string): GuildConfig {
-    this.ensureGuild(guildId);
-    const row = this.db.prepare("SELECT * FROM guild_config WHERE guild_id = ?").get(guildId) as Omit<GuildConfig, "monitor_administrators" | "monitor_attachments"> & { monitor_administrators: number; monitor_attachments: number };
-    return { ...row, monitor_administrators: row.monitor_administrators === 1, monitor_attachments: row.monitor_attachments === 1 };
+    const row = (this.db.prepare("SELECT * FROM guild_config WHERE guild_id = ?").get(guildId) ?? {
+      guild_id: guildId, review_channel_id: null, retention_minutes: this.defaultRetentionMinutes,
+      mode: "all", monitor_administrators: 0, monitor_attachments: 0,
+      monitoring_configured: 0,
+    }) as Omit<GuildConfig, "monitoring_configured" | "monitor_administrators" | "monitor_attachments"> & { monitoring_configured: number; monitor_administrators: number; monitor_attachments: number };
+    return { ...row, monitoring_configured: row.monitoring_configured === 1, monitor_administrators: row.monitor_administrators === 1, monitor_attachments: row.monitor_attachments === 1 };
+  }
+
+  hasConfig(guildId: string): boolean {
+    return this.db.prepare("SELECT 1 FROM guild_config WHERE guild_id = ? AND monitoring_configured = 1").get(guildId) !== undefined;
   }
 
   setReviewChannel(guildId: string, channelId: string): void {
@@ -327,9 +346,9 @@ export class MessageStore {
     this.db.prepare("UPDATE guild_config SET review_channel_id = ? WHERE guild_id = ?").run(channelId, guildId);
   }
 
-  setRetention(guildId: string, hours: number): void {
+  setRetention(guildId: string, minutes: number): void {
     this.ensureGuild(guildId);
-    this.db.prepare("UPDATE guild_config SET retention_hours = ? WHERE guild_id = ?").run(hours, guildId);
+    this.db.prepare("UPDATE guild_config SET retention_minutes = ? WHERE guild_id = ?").run(minutes, guildId);
   }
 
   setMode(guildId: string, mode: MonitorMode): void {
@@ -348,11 +367,45 @@ export class MessageStore {
   }
 
   addRule(guildId: string, kind: RuleKind, value: string): boolean {
-    return this.db.prepare("INSERT OR IGNORE INTO rules (guild_id, kind, value) VALUES (?, ?, ?)").run(guildId, kind, value).changes > 0;
+    return this.db.transaction(() => {
+      this.ensureGuild(guildId);
+      const changed = this.db.prepare("INSERT OR IGNORE INTO rules (guild_id, kind, value) VALUES (?, ?, ?)").run(guildId, kind, value).changes > 0;
+      if (kind === "include_channel") this.db.prepare("UPDATE guild_config SET monitoring_configured = 1 WHERE guild_id = ?").run(guildId);
+      return changed;
+    })();
+  }
+
+  replaceRules(guildId: string, kind: RuleKind, values: string[]): void {
+    const unique = [...new Set(values)].sort();
+    this.db.transaction(() => {
+      this.ensureGuild(guildId);
+      this.db.prepare("DELETE FROM rules WHERE guild_id = ? AND kind = ?").run(guildId, kind);
+      const insert = this.db.prepare("INSERT INTO rules (guild_id, kind, value) VALUES (?, ?, ?)");
+      for (const value of unique) insert.run(guildId, kind, value);
+      if (kind === "include_channel" && unique.length) this.db.prepare("UPDATE guild_config SET monitoring_configured = 1 WHERE guild_id = ?").run(guildId);
+    })();
+  }
+
+  applySetup(guildId: string, channelIds: string[]): void {
+    const unique = [...new Set(channelIds)].sort();
+    this.db.transaction(() => {
+      this.ensureGuild(guildId);
+      this.db.prepare("DELETE FROM rules WHERE guild_id = ? AND kind = 'include_channel'").run(guildId);
+      const insert = this.db.prepare("INSERT INTO rules (guild_id, kind, value) VALUES (?, 'include_channel', ?)");
+      for (const channelId of unique) insert.run(guildId, channelId);
+      this.db.prepare("UPDATE guild_config SET mode = 'all', monitoring_configured = 1 WHERE guild_id = ?").run(guildId);
+    })();
   }
 
   removeRule(guildId: string, kind: RuleKind, value: string): boolean {
-    return this.db.prepare("DELETE FROM rules WHERE guild_id = ? AND kind = ? AND value = ?").run(guildId, kind, value).changes > 0;
+    return this.db.transaction(() => {
+      const changed = this.db.prepare("DELETE FROM rules WHERE guild_id = ? AND kind = ? AND value = ?").run(guildId, kind, value).changes > 0;
+      if (changed && kind === "include_channel") {
+        const remaining = this.db.prepare("SELECT 1 FROM rules WHERE guild_id = ? AND kind = 'include_channel' LIMIT 1").get(guildId);
+        if (!remaining) this.db.prepare("UPDATE guild_config SET monitoring_configured = 0 WHERE guild_id = ?").run(guildId);
+      }
+      return changed;
+    })();
   }
 
   listRules(guildId: string, kind: RuleKind): string[] {

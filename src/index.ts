@@ -7,24 +7,29 @@ import {
   PermissionFlagsBits,
   REST,
   Routes,
+  type ButtonInteraction,
+  type ChannelSelectMenuInteraction,
+  type Guild,
 } from "discord.js";
 import { MonitorMode, RuleKind } from "./database.js";
 import { BUILT_IN_PATTERNS, detectReasons, normalizeDomain } from "./detector.js";
 import { downloadAttachments } from "./attachments.js";
 import { CaptureCoordinator } from "./coordinator.js";
-import { loadConfig } from "./config.js";
+import { RETENTION_PURGE_INTERVAL_MS, loadConfig } from "./config.js";
 import { deliverWithClaim } from "./delivery-claim.js";
 import { deliverEvidence } from "./evidence.js";
 import { createDeliveryRetryWorker } from "./retry-worker.js";
 import { ActiveWorkTracker, createJsonLogger, installGracefulShutdown, safeAsyncHandler } from "./runtime.js";
 import { createGuildDeleteHandler, createMessageEventPolicy, type MonitorMessage } from "./message-policy.js";
-import { buildMonitorCommand, executeMonitorCommand, formatSettings } from "./monitor-command.js";
+import { buildMonitorCommand, executeDeferredEphemeral, executeMonitorCommand, formatDiagnostics, formatSettings } from "./monitor-command.js";
 import { MessageStore } from "./database.js";
+import { MonitorSetupFlow, parseSetupCustomId, renderSetupView } from "./setup-flow.js";
+import { executeDirectChannelInclusion, replyForUnavailableGuild, respondToInteractionFailure } from "./interaction-routing.js";
 
 
 const config = loadConfig();
 const log = createJsonLogger(config.logLevel);
-const store = new MessageStore(config.databasePath, config.retentionHours, {
+const store = new MessageStore(config.databasePath, config.retentionMinutes, {
   busyTimeoutMs: config.databaseBusyTimeoutMs,
   attachmentQuotaBytes: config.storedAttachmentMaxBytes,
 });
@@ -78,6 +83,7 @@ const policy = createMessageEventPolicy({
   log: (event, fields) => log(event, fields, "warn"),
 });
 const handleGuildDelete = createGuildDeleteHandler(store);
+const setupFlow = new MonitorSetupFlow(store);
 
 function toMonitorMessage(message: {
   id: string; guildId: string | null; channelId: string; content: string; createdAt: Date;
@@ -102,12 +108,58 @@ function toMonitorMessage(message: {
   };
 }
 
+async function inaccessibleChannelIds(guild: Guild, channelIds: string[]): Promise<string[]> {
+  const me = guild.members.me ?? await guild.members.fetchMe();
+  const checks = await Promise.all(channelIds.map(async (channelId) => {
+    const channel = guild.channels.cache.get(channelId) ?? await guild.channels.fetch(channelId).catch(() => null);
+    return channel?.permissionsFor(me)?.has(PermissionFlagsBits.ViewChannel) ? null : channelId;
+  }));
+  return checks.filter((channelId): channelId is string => channelId !== null);
+}
+
+async function reviewPermissions(guild: Guild, channelId: string | null) {
+  if (!channelId) return undefined;
+  const me = guild.members.me ?? await guild.members.fetchMe();
+  const channel = guild.channels.cache.get(channelId) ?? await guild.channels.fetch(channelId).catch(() => null);
+  const permissions = channel?.permissionsFor(me);
+  return {
+    viewChannel: permissions?.has(PermissionFlagsBits.ViewChannel) ?? false,
+    sendMessages: permissions?.has(PermissionFlagsBits.SendMessages) ?? false,
+    attachFiles: permissions?.has(PermissionFlagsBits.AttachFiles) ?? false,
+  };
+}
+
 async function handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   if (!interaction.guildId) return;
   const guildId = interaction.guildId;
   const group = interaction.options.getSubcommandGroup(false);
   const subcommand = interaction.options.getSubcommand();
   const path = group ? `${group} ${subcommand}` : subcommand;
+
+  if (path === "setup") {
+    const view = setupFlow.begin(guildId, interaction.user.id);
+    await interaction.reply({ ...renderSetupView(view), ephemeral: true });
+    return;
+  }
+  if (path === "diagnostics") {
+    if (!interaction.guild) {
+      await replyForUnavailableGuild(interaction, "run diagnostics");
+      return;
+    }
+    await executeDeferredEphemeral(interaction, async () => {
+      const guildConfig = store.getConfig(guildId);
+      const includedChannelIds = store.listRules(guildId, "include_channel");
+      const inaccessible = await inaccessibleChannelIds(interaction.guild!, includedChannelIds);
+      return formatDiagnostics({
+        monitoringConfigured: guildConfig.monitoring_configured,
+        reviewChannelId: guildConfig.review_channel_id,
+        reviewPermissions: await reviewPermissions(interaction.guild!, guildConfig.review_channel_id),
+        includedChannelIds,
+        inaccessibleChannelIds: inaccessible,
+      });
+    });
+    return;
+  }
 
   if (path === "help" || path === "status" || path === "forget" || path === "administrators" || path === "attachments" || path === "review-channel") {
     const values: Record<string, string | number | boolean | null | undefined> = {};
@@ -132,9 +184,9 @@ async function handleCommand(interaction: ChatInputCommandInteraction): Promise<
     return;
   }
   if (!group && path === "retention") {
-    const hours = interaction.options.getInteger("hours", true);
-    store.setRetention(guildId, hours);
-    await interaction.reply({ content: `Matching messages will be retained for ${hours} hour(s).`, ephemeral: true });
+    const minutes = interaction.options.getInteger("minutes", true);
+    store.setRetention(guildId, minutes);
+    await interaction.reply({ content: `Captured messages will be retained for ${minutes} minute(s).`, ephemeral: true });
     return;
   }
   if (!group && path === "mode") {
@@ -189,8 +241,55 @@ async function handleCommand(interaction: ChatInputCommandInteraction): Promise<
     await interaction.reply({ content: "The value cannot be empty.", ephemeral: true });
     return;
   }
-  const changed = remove ? store.removeRule(guildId, kind, value) : store.addRule(guildId, kind, value);
-  await interaction.reply({ content: changed ? `Setting ${remove ? "removed" : "added"}.` : `That setting was already ${remove ? "absent" : "configured"}.`, ephemeral: true });
+  if (!remove && kind === "include_channel") {
+    await executeDirectChannelInclusion(
+      interaction,
+      guildId,
+      value,
+      (id, ruleKind, channelId) => store.addRule(id, ruleKind, channelId),
+      inaccessibleChannelIds,
+    );
+    return;
+  }
+  const applyRule = async (): Promise<string> => {
+    const changed = remove ? store.removeRule(guildId, kind, value) : store.addRule(guildId, kind, value);
+    return changed ? `Setting ${remove ? "removed" : "added"}.` : `That setting was already ${remove ? "absent" : "configured"}.`;
+  };
+  await interaction.reply({ content: await applyRule(), ephemeral: true });
+}
+
+async function handleSetupComponent(interaction: ButtonInteraction | ChannelSelectMenuInteraction): Promise<void> {
+  if (!interaction.guildId) return;
+  if (!interaction.guild) {
+    await replyForUnavailableGuild(interaction, "continue setup");
+    return;
+  }
+  await interaction.deferUpdate();
+  const setupAction = parseSetupCustomId(interaction.customId);
+  if (!setupAction) {
+    await interaction.editReply(renderSetupView({ kind: "expired" }));
+    return;
+  }
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    setupFlow.cancel(interaction.guildId, interaction.user.id, setupAction.flowId);
+    await interaction.editReply({ content: "Manage Server permission is required to run monitor setup.", components: [] });
+    return;
+  }
+
+  let view;
+  if (interaction.isChannelSelectMenu() && setupAction.action === "channels") {
+    const inaccessible = await inaccessibleChannelIds(interaction.guild, interaction.values);
+    view = setupFlow.select(interaction.guildId, interaction.user.id, setupAction.flowId, interaction.values, inaccessible);
+  } else if (interaction.isButton() && setupAction.action === "cancel") {
+    view = setupFlow.cancel(interaction.guildId, interaction.user.id, setupAction.flowId);
+  } else {
+    const selected = setupFlow.selectedChannels(interaction.guildId, interaction.user.id, setupAction.flowId);
+    const inaccessible = selected ? await inaccessibleChannelIds(interaction.guild, selected) : [];
+    view = !selected ? { kind: "expired" as const } : setupAction.action === "confirm"
+      ? setupFlow.confirm(interaction.guildId, interaction.user.id, setupAction.flowId, selected, inaccessible)
+      : setupFlow.recheck(interaction.guildId, interaction.user.id, setupAction.flowId, selected, inaccessible);
+  }
+  await interaction.editReply(renderSetupView(view));
 }
 
 function trackedAsyncHandler<Args extends unknown[]>(
@@ -208,13 +307,21 @@ client.once(Events.ClientReady, trackedAsyncHandler("client_ready", async (ready
 }));
 
 client.on(Events.InteractionCreate, trackedAsyncHandler("interaction_create", async (interaction) => {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== "monitor") return;
-  await handleCommand(interaction).catch(async (error: unknown) => {
-    log("command_failed", { error: error instanceof Error ? error.message : String(error) }, "error");
-    const response = { content: "The setting could not be updated. Check the bot logs.", ephemeral: true } as const;
-    if (interaction.replied || interaction.deferred) await interaction.followUp(response);
-    else await interaction.reply(response);
-  });
+  const isSetupComponent = (interaction.isChannelSelectMenu() || interaction.isButton()) && parseSetupCustomId(interaction.customId) !== undefined;
+  if (interaction.isChatInputCommand() && interaction.commandName === "monitor") {
+    await handleCommand(interaction).catch(async (error: unknown) => {
+      log("command_failed", { error: error instanceof Error ? error.message : String(error) }, "error");
+      const response = { content: "The setting could not be updated. Check the bot logs.", ephemeral: true } as const;
+      await respondToInteractionFailure(interaction, response);
+    });
+  } else if (isSetupComponent) {
+    await handleSetupComponent(interaction as ButtonInteraction | ChannelSelectMenuInteraction).catch(async (error: unknown) => {
+      log("setup_failed", { error: error instanceof Error ? error.message : String(error) }, "error");
+      const response = { content: "Setup could not be completed. Run `/monitor setup` again.", components: [] };
+      if (interaction.deferred || interaction.replied) await interaction.editReply(response);
+      else await interaction.reply({ ...response, ephemeral: true });
+    });
+  }
 }));
 
 client.on(Events.MessageCreate, trackedAsyncHandler("message_create", async (message) => {
@@ -246,7 +353,7 @@ const purgeTimer = setInterval(() => {
       log("purge_failed", { error: error instanceof Error ? error.message : String(error) }, "error");
     }
   });
-}, 15 * 60 * 1000);
+}, RETENTION_PURGE_INTERVAL_MS);
 purgeTimer.unref();
 const stopBackgroundWork = () => {
   clearInterval(purgeTimer);

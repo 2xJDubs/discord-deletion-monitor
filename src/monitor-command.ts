@@ -15,9 +15,10 @@ export type CommandMetadata = {
 const manage = "Manage Server";
 export const COMMAND_METADATA: CommandMetadata[] = [
   ["help", "overview", "Show command guidance", manage, "topic (optional)", "/monitor help topic:retention", "Reads configuration only"],
+  ["setup", "setup", "Guide monitored-channel selection and permission checks", manage, "interactive channel selection", "/monitor setup", "Replaces the monitored-channel list only after confirmation"],
   ["review-channel", "setup", "Set the private evidence destination", manage, "channel (required)", "/monitor review-channel channel:#reviews", "Validates bot permissions, then saves the channel"],
-  ["retention", "setup", "Set evidence retention", manage, "hours: 1–2160", "/monitor retention hours:336", "Changes when cached evidence expires"],
-  ["mode", "setup", "Cache all eligible messages or matches only", manage, "value: matching|all", "/monitor mode value:matching", "Changes future capture eligibility"],
+  ["retention", "setup", "Set evidence retention", manage, "minutes: 1–129600", "/monitor retention minutes:60", "Changes when cached evidence expires"],
+  ["mode", "setup", "Cache all eligible messages or matches only", manage, "value: matching|all", "/monitor mode value:all", "Changes future capture eligibility"],
   ["administrators", "privacy", "Monitor or ignore administrator messages", manage, "value: monitor|ignore", "/monitor administrators value:ignore", "Changes future administrator capture"],
   ["attachments", "privacy", "Monitor or ignore attachment-only matches", manage, "value: monitor|ignore", "/monitor attachments value:monitor", "Changes future attachment-only capture"],
   ["keyword add", "detection", "Add a watched phrase", manage, "value (required)", "/monitor keyword add value:urgent", "Adds one detection rule"],
@@ -33,6 +34,7 @@ export const COMMAND_METADATA: CommandMetadata[] = [
   ["role exclude", "scope", "Ignore messages from a trusted role", manage, "role (required)", "/monitor role exclude role:@trusted", "Ignores future messages from that role"],
   ["role remove-exclusion", "scope", "Remove a trusted-role exclusion", manage, "role (required)", "/monitor role remove-exclusion role:@trusted", "Restores role eligibility"],
   ["settings", "diagnostics", "Show bounded configuration previews", manage, "none", "/monitor settings", "Reads settings only"],
+  ["diagnostics", "diagnostics", "Check monitored and review-channel permissions", manage, "none", "/monitor diagnostics", "Reads effective bot permissions only"],
   ["status", "diagnostics", "Show redacted aggregate storage status", manage, "none", "/monitor status", "Reads counts and byte totals; never message content"],
   ["test", "diagnostics", "Test sample text against current rules", manage, "message (required)", "/monitor test message:urgent", "Reads rules; does not store sample text"],
   ["forget", "privacy", "Permanently erase this server's monitor data", manage, "confirm must equal DELETE", "/monitor forget confirm:DELETE", "Atomically deletes configuration, rules, messages, and attachments"],
@@ -58,6 +60,14 @@ export type MonitorCommandRequest = {
   reviewChannelPermissions?: { viewChannel: boolean; sendMessages: boolean; attachFiles: boolean };
 };
 export type MonitorCommandResult = { content: string; ephemeral: true };
+export async function executeDeferredEphemeral(
+  interaction: { deferReply(options: { ephemeral: true }): Promise<unknown>; editReply(options: { content: string }): Promise<unknown> },
+  action: () => Promise<string>,
+): Promise<void> {
+  await interaction.deferReply({ ephemeral: true });
+  await interaction.editReply({ content: await action() });
+}
+
 type MonitorCommandStore = {
   getGuildStatus(guildId: string): { storedMessages: number; pendingMessages: number; oldestPendingAt: string | null; attachments: number; attachmentBytes: number; attachmentQuotaBytes: number };
   deleteGuildData(guildId: string): { messages: number; attachments: number; rules: number; config: number };
@@ -106,7 +116,7 @@ export async function executeMonitorCommand(request: MonitorCommandRequest, stor
 }
 
 export function formatSettings(
-  config: { mode: string; retention_hours: number; review_channel_id: string | null; monitor_administrators?: boolean; monitor_attachments?: boolean },
+  config: { mode: string; retention_minutes: number; review_channel_id: string | null; monitor_administrators?: boolean; monitor_attachments?: boolean },
   rules: Record<RuleKind, string[]>,
 ): string {
   const preview = (label: string, values: string[], mention: "channel" | "role" | null = null) => {
@@ -115,13 +125,53 @@ export function formatSettings(
     return `${label} (${values.length}): ${shown}${values.length > 5 ? `, +${values.length - 5} more` : ""}`;
   };
   return [
-    `Mode: **${config.mode}**`, `Retention: **${config.retention_hours} hours**`,
+    `Mode: **${config.mode}**`, `Retention: **${config.retention_minutes} minutes**`,
     `Review channel: ${config.review_channel_id ? `<#${config.review_channel_id}>` : "not configured"}`,
     `Administrators: **${config.monitor_administrators ? "monitored" : "ignored"}**`,
     `Attachment-only: **${config.monitor_attachments ? "monitored" : "ignored"}**`,
     preview("Keywords", rules.keyword), preview("Domains", rules.domain), preview("Patterns", rules.pattern),
     preview("Included channels", rules.include_channel, "channel"), preview("Excluded channels", rules.exclude_channel, "channel"),
     preview("Excluded roles", rules.exclude_role, "role"),
+  ].join("\n").slice(0, 2000);
+}
+
+export function monitoredChannelPermissionError(channelId: string, viewChannel: boolean): string | null {
+  return viewChannel ? null : `I cannot monitor <#${channelId}> because I cannot view it. Add the **Deletion Monitor** role to that channel or its category and enable **View Channel**, then try again.`;
+}
+
+export function formatDiagnostics(input: {
+  monitoringConfigured?: boolean;
+  reviewChannelId: string | null;
+  reviewPermissions?: { viewChannel: boolean; sendMessages: boolean; attachFiles: boolean };
+  includedChannelIds: string[];
+  inaccessibleChannelIds: string[];
+}): string {
+  const problems: string[] = [];
+  if (!input.reviewChannelId) {
+    problems.push("Review channel is not configured.");
+  } else {
+    const missing = [
+      !input.reviewPermissions?.viewChannel && "View Channel",
+      !input.reviewPermissions?.sendMessages && "Send Messages",
+      !input.reviewPermissions?.attachFiles && "Attach Files",
+    ].filter(Boolean);
+    if (missing.length) problems.push(`Review channel <#${input.reviewChannelId}> is missing: ${missing.join(", ")}.`);
+  }
+  if (input.inaccessibleChannelIds.length) {
+    const shown = input.inaccessibleChannelIds.slice(0, 20).map((id) => `<#${id}>`).join(", ");
+    const more = input.inaccessibleChannelIds.length > 20 ? `, +${input.inaccessibleChannelIds.length - 20} more` : "";
+    problems.push(`Monitored channels I cannot view: ${shown}${more}.`);
+  }
+  const scope = input.monitoringConfigured === false
+    ? "Monitoring is not configured. Run `/monitor setup` to choose channels."
+    : input.includedChannelIds.length
+    ? `Configured monitored channels: **${input.includedChannelIds.length}**.`
+    : "Configured monitored channels: **all channels visible to the bot**.";
+  return [
+    "**Monitor diagnostics**",
+    scope,
+    problems.length ? "**Action required**" : "**Healthy** — required channel permissions are available.",
+    ...problems.map((problem) => `• ${problem}`),
   ].join("\n").slice(0, 2000);
 }
 
@@ -135,9 +185,10 @@ export function buildMonitorCommand() {
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand((sub) => sub.setName("help").setDescription("Show command guidance")
       .addStringOption((option) => option.setName("topic").setDescription("Help topic").addChoices(...topics.map((topic) => ({ name: topic, value: topic })))))
+    .addSubcommand((sub) => sub.setName("setup").setDescription("Guided monitored-channel setup"))
     .addSubcommand((sub) => sub.setName("review-channel").setDescription("Set the private evidence channel")
       .addChannelOption((option) => option.setName("channel").setDescription("Moderator review channel").addChannelTypes(ChannelType.GuildText).setRequired(true)))
-    .addSubcommand((sub) => sub.setName("retention").setDescription("Set retention hours").addIntegerOption((option) => option.setName("hours").setDescription("Hours (1–2160)").setMinValue(1).setMaxValue(2160).setRequired(true)))
+    .addSubcommand((sub) => sub.setName("retention").setDescription("Set retention minutes").addIntegerOption((option) => option.setName("minutes").setDescription("Minutes (1–129600)").setMinValue(1).setMaxValue(129600).setRequired(true)))
     .addSubcommand((sub) => sub.setName("mode").setDescription("Choose capture mode").addStringOption((option) => option.setName("value").setDescription("Mode").setRequired(true).addChoices({ name: "Matching only", value: "matching" }, { name: "All", value: "all" })))
     .addSubcommand((sub) => valueChoice(sub.setName("administrators").setDescription("Monitor or ignore administrators")))
     .addSubcommand((sub) => valueChoice(sub.setName("attachments").setDescription("Monitor or ignore attachment-only messages")));
@@ -158,6 +209,7 @@ export function buildMonitorCommand() {
     .addSubcommand((sub) => sub.setName("remove-exclusion").setDescription("Remove role exclusion").addRoleOption((o) => o.setName("role").setDescription("Role").setRequired(true))));
   return command
     .addSubcommand((sub) => sub.setName("settings").setDescription("Show bounded settings"))
+    .addSubcommand((sub) => sub.setName("diagnostics").setDescription("Check bot channel permissions"))
     .addSubcommand((sub) => sub.setName("status").setDescription("Show redacted aggregate status"))
     .addSubcommand((sub) => sub.setName("test").setDescription("Test detection rules").addStringOption((o) => o.setName("message").setDescription("Sample message").setRequired(true).setMaxLength(1000)))
     .addSubcommand((sub) => sub.setName("forget").setDescription("Permanently erase monitor data").addStringOption((o) => o.setName("confirm").setDescription("Type DELETE").setRequired(true).setMaxLength(6)));

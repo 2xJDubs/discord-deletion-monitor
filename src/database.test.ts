@@ -45,7 +45,7 @@ describe("MessageStore", () => {
     store.close();
   });
 
-  it("version-migrates legacy guild config without resetting retention or mode", () => {
+  it("migrates legacy retention hours to equivalent minutes without resetting mode", () => {
     const path = tempPath();
     const legacy = new Database(path);
     legacy.exec(`
@@ -60,14 +60,49 @@ describe("MessageStore", () => {
     `);
     legacy.close();
 
-    const store = new MessageStore(path, 168);
-    expect(store.getConfig("custom")).toMatchObject({ retention_hours: 72, mode: "all" });
-    expect(store.getConfig("defaults")).toMatchObject({ retention_hours: 336, mode: "matching" });
+    const store = new MessageStore(path, 60);
+    expect(store.getConfig("custom")).toMatchObject({ retention_minutes: 4320, mode: "all" });
+    expect(store.getConfig("defaults")).toMatchObject({ retention_minutes: 20160, mode: "matching" });
     store.close();
 
     const migrated = new Database(path, { readonly: true });
     expect(migrated.pragma("user_version", { simple: true })).toBeGreaterThan(0);
     migrated.close();
+  });
+
+  it("preserves monitoring for legacy guilds that had rules but no config row", () => {
+    const path = tempPath();
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE guild_config (guild_id TEXT PRIMARY KEY, review_channel_id TEXT);
+      CREATE TABLE rules (guild_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (guild_id, kind, value));
+      INSERT INTO rules VALUES ('rules-only', 'keyword', 'urgent');
+    `);
+    legacy.close();
+
+    const store = new MessageStore(path, 60);
+    expect(store.hasConfig("rules-only")).toBe(true);
+    expect(store.getConfig("rules-only").mode).toBe("all");
+    store.close();
+  });
+
+  it("defaults newly configured guilds to 60 retention minutes and all-message mode", () => {
+    const store = new MessageStore(tempPath(), 60);
+    expect(store.getConfig("new-guild")).toMatchObject({ retention_minutes: 60, mode: "all" });
+    store.close();
+  });
+
+  it("stays fail-closed through non-scope settings and activates on explicit monitoring scope", () => {
+    const store = new MessageStore(tempPath(), 60);
+    expect(store.hasConfig("new-guild")).toBe(false);
+    store.setRetention("new-guild", 90);
+    store.setMode("new-guild", "matching");
+    expect(store.hasConfig("new-guild")).toBe(false);
+    expect(store.getConfig("new-guild").mode).toBe("matching");
+    store.addRule("new-guild", "include_channel", "selected");
+    expect(store.hasConfig("new-guild")).toBe(true);
+    expect(store.getConfig("new-guild")).toMatchObject({ retention_minutes: 90, mode: "matching" });
+    store.close();
   });
 
   it("defaults monitoring flags off and persists explicit guild configuration", () => {
@@ -79,6 +114,54 @@ describe("MessageStore", () => {
     store.close();
     store = new MessageStore(path, 336);
     expect(store.getConfig("g1")).toMatchObject({ monitor_administrators: true, monitor_attachments: true });
+    store.close();
+  });
+
+  it("atomically replaces monitored channels without changing other rules", () => {
+    const store = new MessageStore(tempPath(), 60);
+    store.addRule("g1", "include_channel", "old-a");
+    store.addRule("g1", "include_channel", "old-b");
+    store.addRule("g1", "keyword", "urgent");
+    store.replaceRules("g1", "include_channel", ["new-b", "new-a", "new-a"]);
+    expect(store.listRules("g1", "include_channel")).toEqual(["new-a", "new-b"]);
+    expect(store.listRules("g1", "keyword")).toEqual(["urgent"]);
+    store.close();
+  });
+
+  it("atomically applies all-message setup with the replacement channel scope", () => {
+    const store = new MessageStore(tempPath(), 60);
+    store.setMode("g1", "matching");
+    store.addRule("g1", "include_channel", "old");
+    store.applySetup("g1", ["new-b", "new-a"]);
+    expect(store.getConfig("g1").mode).toBe("all");
+    expect(store.listRules("g1", "include_channel")).toEqual(["new-a", "new-b"]);
+    store.close();
+  });
+
+  it("disables monitoring when removing the final included channel", () => {
+    const store = new MessageStore(tempPath(), 60);
+    store.addRule("g1", "include_channel", "only-channel");
+
+    expect(store.removeRule("g1", "include_channel", "only-channel")).toBe(true);
+    expect(store.listRules("g1", "include_channel")).toEqual([]);
+    expect(store.hasConfig("g1")).toBe(false);
+    store.close();
+  });
+
+  it("preserves migrated all-visible-channel monitoring when an absent include is not removed", () => {
+    const path = tempPath();
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE guild_config (guild_id TEXT PRIMARY KEY, review_channel_id TEXT);
+      INSERT INTO guild_config VALUES ('legacy-all', 'review');
+    `);
+    legacy.close();
+    const store = new MessageStore(path, 60);
+
+    expect(store.hasConfig("legacy-all")).toBe(true);
+    expect(store.listRules("legacy-all", "include_channel")).toEqual([]);
+    expect(store.removeRule("legacy-all", "include_channel", "not-present")).toBe(false);
+    expect(store.hasConfig("legacy-all")).toBe(true);
     store.close();
   });
 
@@ -132,19 +215,19 @@ describe("MessageStore", () => {
     second.close();
   });
 
-  it("fences claims and pre-send delivery at the retention boundary across stores", () => {
+  it("fences claims and pre-send delivery at the minute retention boundary across stores", () => {
     const path = tempPath();
-    const first = new MessageStore(path, 24);
-    const second = new MessageStore(path, 24);
+    const first = new MessageStore(path, 1440);
+    const second = new MessageStore(path, 1440);
     first.setRetention("g1", 1);
     first.save(message("m1", "2026-01-01T00:00:00Z"));
     first.markDeleted("m1", new Date("2026-01-01T00:00:00Z"));
-    expect(first.claimDelivery("m1", "worker-a", new Date("2026-01-01T00:59:59Z"), 120_000)).toBe(true);
-    expect(first.isClaimDeliverable("m1", "worker-a", new Date("2026-01-01T00:59:59Z"))).toBe(true);
-    expect(first.renewDeliveryClaim("m1", "worker-a", new Date("2026-01-01T01:00:00Z"), 120_000)).toBe(false);
-    expect(first.isClaimDeliverable("m1", "worker-a", new Date("2026-01-01T01:00:00Z"))).toBe(false);
-    expect(second.claimDelivery("m1", "worker-b", new Date("2026-01-01T01:00:00Z"), 120_000)).toBe(false);
-    expect(second.purgeExpired(new Date("2026-01-01T01:00:00Z"))).toBe(1);
+    expect(first.claimDelivery("m1", "worker-a", new Date("2026-01-01T00:00:59Z"), 120_000)).toBe(true);
+    expect(first.isClaimDeliverable("m1", "worker-a", new Date("2026-01-01T00:00:59Z"))).toBe(true);
+    expect(first.renewDeliveryClaim("m1", "worker-a", new Date("2026-01-01T00:01:00Z"), 120_000)).toBe(false);
+    expect(first.isClaimDeliverable("m1", "worker-a", new Date("2026-01-01T00:01:00Z"))).toBe(false);
+    expect(second.claimDelivery("m1", "worker-b", new Date("2026-01-01T00:01:00Z"), 120_000)).toBe(false);
+    expect(second.purgeExpired(new Date("2026-01-01T00:01:00Z"))).toBe(1);
     first.close();
     second.close();
   });
@@ -188,7 +271,7 @@ describe("MessageStore", () => {
   });
 
   it("expires undeleted evidence from creation and deleted evidence from deletion time", () => {
-    const store = new MessageStore(tempPath(), 1);
+    const store = new MessageStore(tempPath(), 60);
     store.save(message("old", "2026-01-01T00:00:00Z"));
     store.save(message("deleted", "2026-01-01T00:00:00Z"));
     store.markDeleted("deleted", new Date("2026-01-02T00:00:00Z"));

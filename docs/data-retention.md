@@ -16,7 +16,7 @@ The Discord token is never stored in SQLite.
 
 ## Retention
 
-Each guild controls retention with `/monitor retention`. The default is 336 hours (14 days), and the command allows 1 through 2,160 hours. Evidence is deleted when either:
+Each guild controls retention with `/monitor retention`. The default is 60 minutes, and the command allows 1 through 129,600 minutes (90 days). The purge worker runs once per minute. Evidence is deleted when either:
 
 1. it is successfully delivered to the configured review channel after message deletion, or
 2. its retention period expires.
@@ -35,4 +35,4 @@ With the default 1 GiB stored-attachment quota, the live database plus approxima
 
 ## Access and deletion
 
-Restrict the Discord review channel, LXC shell, SQLite database, and backups to trusted administrators. Production environment files are `root:root` mode `0600`; systemd reads them before starting the unprivileged process. Removing a guild's configuration and evidence is currently an operator database task; stop the service and take a backup before manual maintenance.
+Restrict the Discord review channel, LXC shell, SQLite database, and backups to trusted administrators. Production environment files are `root:root` mode `0600`; systemd reads them before starting the unprivileged process. `/monitor forget confirm:DELETE` atomically removes one guild's configuration, rules, messages, and attachments.
