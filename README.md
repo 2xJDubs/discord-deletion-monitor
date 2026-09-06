@@ -1,30 +1,34 @@
 # Discord Deletion Monitor
 
-A multi-server Discord bot that caches suspicious messages and sends evidence to each server's private review channel only when a cached message is deleted.
+A multi-server Discord bot that caches eligible messages and sends evidence to each server's private review channel only when a cached message is deleted.
 
 ## Setup
 
 1. Create a Discord application and bot in the Developer Portal.
 2. Enable the **Message Content Intent**.
-3. Invite the bot with `View Channels`, `Read Message History`, `Send Messages`, and `Attach Files` permissions. Do not grant Administrator.
+3. Invite the bot with `View Channels`, `Read Message History`, `Send Messages`, and `Attach Files` permissions. Do not grant Administrator. Existing category or channel overwrites can still hide channels from the bot.
 4. Copy `.env.example` to `.env` and add the bot token.
 5. Run `pnpm install`, then `pnpm dev`.
 6. Run `/monitor review-channel` in each server and select its private moderator channel.
-7. Run `/monitor role exclude` for every trusted admin or moderator role whose messages should be ignored.
+7. Run `/monitor setup`, select 1–25 monitored text channels, grant the **Deletion Monitor** role **View Channel** where prompted, recheck, and confirm. Confirmation replaces the prior monitored-channel list and selects `all` mode.
+8. Run `/monitor role exclude` for every trusted admin or moderator role whose messages should be ignored.
+9. Run `/monitor diagnostics` and resolve every reported permission problem.
 
 The `/monitor` command requires `Manage Server`. Configuration and cached evidence are isolated by Discord guild ID.
 
 ## Commands
 
 - `/monitor review-channel` sets the private evidence destination.
-- `/monitor retention` sets cache lifetime from 1 to 2,160 hours.
-- `/monitor mode` chooses `matching` (default) or `all`.
+- `/monitor setup` interactively replaces the monitored-channel list after permission checks and confirmation.
+- `/monitor retention` sets cache lifetime from 1 to 129,600 minutes; the default is 60 minutes.
+- `/monitor mode` chooses `all` (default) or `matching`.
 - `/monitor keyword add|remove` manages watched phrases.
 - `/monitor domain add|remove` manages watched domains.
 - `/monitor pattern add|remove` manages built-in scam patterns.
 - `/monitor channel include|exclude|remove-include|remove-exclude` controls channel scope.
 - `/monitor role exclude|remove-exclusion` manages trusted roles that bypass monitoring.
 - `/monitor settings` shows the server's configuration.
+- `/monitor diagnostics` checks effective monitored-channel and review-channel permissions.
 - `/monitor test` checks sample text without saving it.
 
 In `matching` mode, **every message containing a link is cached automatically**, even if the domain is not explicitly listed. Configured keywords, domains, and built-in patterns add further reasons to save a message. Members with Discord's Administrator permission and members with any excluded role are ignored before detection runs.

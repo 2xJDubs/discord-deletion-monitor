@@ -1,8 +1,9 @@
 export type LogLevel = "debug" | "info" | "warn" | "error";
+export const RETENTION_PURGE_INTERVAL_MS = 60_000;
 export type AppConfig = {
   token: string;
   databasePath: string;
-  retentionHours: number;
+  retentionMinutes: number;
   attachmentMaxFileBytes: number;
   attachmentMaxTotalBytes: number;
   attachmentDownloadTimeoutMs: number;
@@ -37,6 +38,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (attachmentMaxTotalBytes * captureConcurrency > 128 * 1024 * 1024) {
     throw new Error("CAPTURE_CONCURRENCY and ATTACHMENT_MAX_TOTAL_BYTES exceed the 128 MiB capture memory budget");
   }
+  const retentionMinutes = env.RETENTION_MINUTES !== undefined && env.RETENTION_MINUTES !== ""
+    ? positiveInteger(env, "RETENTION_MINUTES", 60, 129_600)
+    : positiveInteger(env, "RETENTION_HOURS", 1, 2_160) * 60;
   return {
     token,
     databasePath: (() => {
@@ -45,7 +49,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       if (!path) throw new Error("DATABASE_PATH must not be empty");
       return path;
     })(),
-    retentionHours: positiveInteger(env, "RETENTION_HOURS", 336, 2160),
+    retentionMinutes,
     attachmentMaxFileBytes,
     attachmentMaxTotalBytes,
     attachmentDownloadTimeoutMs: positiveInteger(env, "ATTACHMENT_DOWNLOAD_TIMEOUT_MS", 10_000, 120_000),

@@ -1,5 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { COMMAND_METADATA, buildMonitorCommand, executeMonitorCommand, formatHelp, formatSettings } from "./monitor-command.js";
+import {
+  COMMAND_METADATA,
+  buildMonitorCommand,
+  executeDeferredEphemeral,
+  executeMonitorCommand,
+  formatDiagnostics,
+  formatHelp,
+  formatSettings,
+  monitoredChannelPermissionError,
+} from "./monitor-command.js";
 
 describe("monitor command help", () => {
   it("covers every registered command path without exceeding Discord limits", () => {
@@ -27,9 +36,39 @@ describe("monitor command help", () => {
     expect(formatHelp("not-real")).toContain("Available commands");
     expect(formatHelp("not-real").length).toBeLessThanOrEqual(2000);
   });
+
+  it("registers guided setup, diagnostics, and minute-based retention metadata", () => {
+    const paths = new Set(COMMAND_METADATA.map((item) => item.path));
+    expect(paths).toContain("setup");
+    expect(paths).toContain("diagnostics");
+    expect(COMMAND_METADATA.find((item) => item.path === "retention")?.arguments).toContain("minutes");
+    const retention = buildMonitorCommand().toJSON().options?.find((option) => option.name === "retention");
+    const retentionOption = retention && "options" in retention ? retention.options?.[0] : undefined;
+    expect(retentionOption).toMatchObject({ name: "minutes", min_value: 1, max_value: 129600 });
+  });
 });
 
 describe("monitor command execution", () => {
+  it("acknowledges ephemerally before awaiting Discord REST diagnostics and edits the deferred reply", async () => {
+    const events: string[] = [];
+    let finishFetch!: () => void;
+    const interaction = {
+      deferReply: vi.fn(async (options: { ephemeral: boolean }) => { events.push(`defer:${options.ephemeral}`); }),
+      editReply: vi.fn(async ({ content }: { content: string }) => { events.push(`edit:${content}`); }),
+    };
+    const pending = executeDeferredEphemeral(interaction, async () => {
+      events.push("fetch");
+      await new Promise<void>((resolve) => { finishFetch = resolve; });
+      return "diagnostics complete";
+    });
+
+    await vi.waitFor(() => expect(events).toEqual(["defer:true", "fetch"]));
+    expect(interaction.editReply).not.toHaveBeenCalled();
+    finishFetch();
+    await pending;
+    expect(events).toEqual(["defer:true", "fetch", "edit:diagnostics complete"]);
+  });
+
   it("formats status from aggregates without exposing stored content", async () => {
     const store = { getGuildStatus: () => ({ storedMessages: 3, pendingMessages: 1, oldestPendingAt: "2026-01-01T00:00:00Z", attachments: 2, attachmentBytes: 42, attachmentQuotaBytes: 100 }) };
     const result = await executeMonitorCommand({ guildId: "g1", path: "status", values: {} }, store as never);
@@ -67,12 +106,39 @@ describe("monitor command execution", () => {
 
   it("bounds settings with counts and previews", () => {
     const many = Array.from({ length: 500 }, (_, index) => `rule-${index}-${"x".repeat(30)}`);
-    const output = formatSettings({ mode: "matching", retention_hours: 336, review_channel_id: null, monitor_administrators: false, monitor_attachments: false }, {
+    const output = formatSettings({ mode: "matching", retention_minutes: 90, review_channel_id: null, monitor_administrators: false, monitor_attachments: false }, {
       keyword: many, domain: many, pattern: [], include_channel: many, exclude_channel: many, exclude_role: many,
     });
     expect(output.length).toBeLessThanOrEqual(2000);
     expect(output).toContain("Keywords (500)");
     expect(output).toContain("+495 more");
+    expect(output).toContain("Retention: **90 minutes**");
+  });
+
+  it("blocks inaccessible monitored channels and reports bounded diagnostics", () => {
+    expect(monitoredChannelPermissionError("hidden", false)).toContain("<#hidden>");
+    expect(monitoredChannelPermissionError("visible", true)).toBeNull();
+    const output = formatDiagnostics({
+      reviewChannelId: "review",
+      reviewPermissions: { viewChannel: true, sendMessages: false, attachFiles: true },
+      includedChannelIds: ["visible", "hidden"],
+      inaccessibleChannelIds: ["hidden"],
+    });
+    expect(output).toContain("<#hidden>");
+    expect(output).toContain("Send Messages");
+    expect(output).toContain("Action required");
+    expect(output.length).toBeLessThanOrEqual(2000);
+  });
+
+  it("reports an unconfigured guild as inactive rather than all-channel monitoring", () => {
+    const output = formatDiagnostics({
+      monitoringConfigured: false,
+      reviewChannelId: null,
+      includedChannelIds: [],
+      inaccessibleChannelIds: [],
+    });
+    expect(output).toContain("Monitoring is not configured");
+    expect(output).not.toContain("all channels visible");
   });
 
   it("requires exact DELETE confirmation before atomically forgetting guild data", async () => {

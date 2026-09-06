@@ -1,16 +1,19 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { loadConfig } from "./config.js";
+import { RETENTION_PURGE_INTERVAL_MS, loadConfig } from "./config.js";
 import { ActiveWorkTracker, createJsonLogger, installGracefulShutdown, safeAsyncHandler } from "./runtime.js";
 
 describe("loadConfig", () => {
+  it("purges at minute granularity", () => {
+    expect(RETENTION_PURGE_INTERVAL_MS).toBe(60_000);
+  });
   it("trims DATABASE_PATH and rejects whitespace-only paths", () => {
     expect(loadConfig({ DISCORD_TOKEN: "token", DATABASE_PATH: "  /tmp/messages.db  " }).databasePath).toBe("/tmp/messages.db");
     expect(() => loadConfig({ DISCORD_TOKEN: "token", DATABASE_PATH: "   " })).toThrow(/DATABASE_PATH/);
   });
 
   it.each([
-    ["RETENTION_HOURS", "2161"],
+    ["RETENTION_MINUTES", "129601"],
     ["ATTACHMENT_MAX_FILE_BYTES", String(64 * 1024 * 1024 + 1)],
     ["ATTACHMENT_MAX_TOTAL_BYTES", String(64 * 1024 * 1024 + 1)],
     ["ATTACHMENT_DOWNLOAD_TIMEOUT_MS", "120001"],
@@ -26,11 +29,17 @@ describe("loadConfig", () => {
   });
   it("parses supported numeric environment configuration", () => {
     expect(loadConfig({
-      DISCORD_TOKEN: "token", RETENTION_HOURS: "24", ATTACHMENT_MAX_FILE_BYTES: "100",
+      DISCORD_TOKEN: "token", RETENTION_MINUTES: "90", ATTACHMENT_MAX_FILE_BYTES: "100",
       ATTACHMENT_MAX_TOTAL_BYTES: "250", ATTACHMENT_DOWNLOAD_TIMEOUT_MS: "3000",
       DATABASE_BUSY_TIMEOUT_MS: "4000", LOG_LEVEL: "warn",
-    })).toMatchObject({ retentionHours: 24, attachmentMaxFileBytes: 100, attachmentMaxTotalBytes: 250,
+    })).toMatchObject({ retentionMinutes: 90, attachmentMaxFileBytes: 100, attachmentMaxTotalBytes: 250,
       attachmentDownloadTimeoutMs: 3000, databaseBusyTimeoutMs: 4000, logLevel: "warn" });
+  });
+
+  it("defaults retention to 60 minutes and converts the legacy hours setting", () => {
+    expect(loadConfig({ DISCORD_TOKEN: "token" }).retentionMinutes).toBe(60);
+    expect(loadConfig({ DISCORD_TOKEN: "token", RETENTION_HOURS: "24" }).retentionMinutes).toBe(1440);
+    expect(loadConfig({ DISCORD_TOKEN: "token", RETENTION_MINUTES: "90", RETENTION_HOURS: "24" }).retentionMinutes).toBe(90);
   });
 
   it("parses and bounds queue, storage, retry, and shutdown settings", () => {

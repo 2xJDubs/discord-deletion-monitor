@@ -19,6 +19,7 @@ export type MonitorMessage = {
 };
 
 type PolicyStore = {
+  hasConfig(guildId: string): boolean;
   getConfig(guildId: string): { mode: "all" | "matching"; monitor_administrators?: boolean; monitor_attachments?: boolean };
   listRules(guildId: string, kind: RuleKind): string[];
   get(messageId: string): { matched_reasons: string } | undefined;
@@ -56,6 +57,7 @@ export function createMessageEventPolicy(deps: {
     const message = await resolve(input);
     if (!message?.guildId || !message.author || message.author.bot || message.webhookId) return false;
     const guildId = message.guildId;
+    if (!deps.store.hasConfig(guildId)) return false;
     const config = deps.store.getConfig(guildId);
     if (message.administrator && !config.monitor_administrators) return false;
     if (deps.store.listRules(guildId, "exclude_role").some((id) => message.roleIds.includes(id))) return false;

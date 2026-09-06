@@ -14,7 +14,8 @@ function message(overrides: Partial<MonitorMessage> = {}): MonitorMessage {
 
 function setup() {
   const store = {
-    getConfig: vi.fn(() => ({ mode: "matching" as const, monitor_administrators: false, monitor_attachments: false })),
+    hasConfig: vi.fn(() => true),
+    getConfig: vi.fn((): { mode: "all" | "matching"; monitor_administrators: boolean; monitor_attachments: boolean } => ({ mode: "matching", monitor_administrators: false, monitor_attachments: false })),
     listRules: vi.fn((_guildId: string, kind: string) => kind === "keyword" ? ["urgent"] : []),
     get: vi.fn(() => undefined as { matched_reasons: string } | undefined),
     markDeleted: vi.fn(() => true),
@@ -25,6 +26,17 @@ function setup() {
 }
 
 describe("message event policy", () => {
+  it("captures nothing for an unconfigured guild even when defaults are all-message mode", async () => {
+    const ctx = setup();
+    ctx.store.hasConfig.mockReturnValue(false);
+    ctx.store.getConfig.mockReturnValue({ mode: "all", monitor_administrators: false, monitor_attachments: false });
+
+    await expect(ctx.policy.create(message())).resolves.toBe(false);
+
+    expect(ctx.coordinator.capture).not.toHaveBeenCalled();
+    expect(ctx.store.getConfig).not.toHaveBeenCalled();
+  });
+
   it("keeps an ever-matching message monitored while capturing its latest benign edit", async () => {
     const ctx = setup();
     ctx.store.get.mockReturnValue({ matched_reasons: JSON.stringify(["keyword: urgent"]) });

@@ -67,6 +67,8 @@ sudo systemctl start discord-deletion-monitor
 sudo systemctl enable --now discord-deletion-monitor-backup.timer
 ```
 
+Set `RETENTION_MINUTES=60` in `/etc/discord-deletion-monitor.env`. Upgrades temporarily accept legacy `RETENTION_HOURS` only when `RETENTION_MINUTES` is absent; the minute setting takes precedence. After startup, run `/monitor review-channel`, `/monitor setup`, and `/monitor diagnostics` in every server. The setup wizard asks for 1–25 monitored text channels, reports channels hidden by Discord category/channel overwrites, waits for an administrator to grant the **Deletion Monitor** role **View Channel**, rechecks access, and replaces the existing monitored-channel list only after confirmation. It does not request `Administrator` or `Manage Roles` and never changes Discord permissions itself.
+
 Both environment files are deliberately `root:root` mode `0600`. The systemd manager reads `EnvironmentFile=` while privileged and supplies the parsed environment before starting the unprivileged process; the `discord-monitor` account does not need filesystem read permission. The installer creates and repairs these permissions on every run and rejects symlinked/non-regular environment files. Verify the configured paths and effective permissions:
 
 ```bash
