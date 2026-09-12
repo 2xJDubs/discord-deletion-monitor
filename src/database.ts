@@ -21,6 +21,7 @@ export type StoredMessage = {
   channel_id: string;
   author_id: string;
   author_tag: string;
+  author_avatar_url?: string | null;
   content: string;
   attachment_urls: string;
   matched_reasons: string;
@@ -32,6 +33,7 @@ export type StoredMessage = {
   delivery_claim_token?: string | null;
   delivery_claimed_until?: string | null;
   delivery_batch_index?: number;
+  delivery_batch_plan_version?: number;
 };
 
 export type StoredAttachment = {
@@ -69,7 +71,7 @@ export type DeleteGuildDataResult = {
   config: number;
 };
 
-export const DATABASE_SCHEMA_VERSION = 4;
+export const DATABASE_SCHEMA_VERSION = 6;
 
 export class MessageStore {
   private readonly db: Database.Database;
@@ -85,9 +87,9 @@ export class MessageStore {
     this.db.pragma("foreign_keys = ON");
     this.db.pragma(`busy_timeout = ${options.busyTimeoutMs ?? 5000}`);
     this.db.pragma("journal_mode = WAL");
+    this.db.transaction(() => {
     const schemaVersion = Number(this.db.pragma("user_version", { simple: true }));
     if (schemaVersion > DATABASE_SCHEMA_VERSION) throw new Error(`Database schema version ${schemaVersion} is newer than supported version ${DATABASE_SCHEMA_VERSION}`);
-    this.db.transaction(() => {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS guild_config (
         guild_id TEXT PRIMARY KEY,
@@ -110,6 +112,7 @@ export class MessageStore {
         channel_id TEXT NOT NULL,
         author_id TEXT NOT NULL,
         author_tag TEXT NOT NULL,
+        author_avatar_url TEXT,
         content TEXT NOT NULL,
         attachment_urls TEXT NOT NULL,
         matched_reasons TEXT NOT NULL DEFAULT '[]',
@@ -120,7 +123,8 @@ export class MessageStore {
         last_delivery_error TEXT,
         delivery_claim_token TEXT,
         delivery_claimed_until TEXT,
-        delivery_batch_index INTEGER NOT NULL DEFAULT 0
+        delivery_batch_index INTEGER NOT NULL DEFAULT 0,
+        delivery_batch_plan_version INTEGER NOT NULL DEFAULT 2
       );
       CREATE TABLE IF NOT EXISTS attachments (
         attachment_id TEXT NOT NULL,
@@ -142,6 +146,7 @@ export class MessageStore {
     this.ensureColumn("guild_config", "monitor_administrators", "INTEGER NOT NULL DEFAULT 0 CHECK(monitor_administrators IN (0, 1))");
     this.ensureColumn("guild_config", "monitor_attachments", "INTEGER NOT NULL DEFAULT 0 CHECK(monitor_attachments IN (0, 1))");
     this.ensureColumn("messages", "matched_reasons", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("messages", "author_avatar_url", "TEXT");
     this.ensureColumn("messages", "deleted_at", "TEXT");
     this.ensureColumn("messages", "delivery_attempts", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("messages", "next_attempt_at", "TEXT");
@@ -149,11 +154,12 @@ export class MessageStore {
     this.ensureColumn("messages", "delivery_claim_token", "TEXT");
     this.ensureColumn("messages", "delivery_claimed_until", "TEXT");
     this.ensureColumn("messages", "delivery_batch_index", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("messages", "delivery_batch_plan_version", `INTEGER NOT NULL DEFAULT ${schemaVersion >= 5 ? 2 : 1}`);
     this.db.exec(`INSERT OR IGNORE INTO guild_config (guild_id, monitoring_configured)
       SELECT guild_id, 1 FROM rules UNION SELECT guild_id, 1 FROM messages`);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_due ON messages(next_attempt_at, delivery_claimed_until, deleted_at)");
     if (schemaVersion < DATABASE_SCHEMA_VERSION) this.db.pragma(`user_version = ${DATABASE_SCHEMA_VERSION}`);
-    })();
+    }).immediate();
   }
 
   private migrateGuildConfig(): void {
@@ -201,11 +207,13 @@ export class MessageStore {
   save(message: StoredMessage, attachments: StoredAttachment[] = []): SaveResult {
     return this.db.transaction(() => {
       this.db.prepare(`INSERT INTO messages
-        (message_id, guild_id, channel_id, author_id, author_tag, content, attachment_urls, matched_reasons, created_at)
-        VALUES (@message_id, @guild_id, @channel_id, @author_id, @author_tag, @content, @attachment_urls, @matched_reasons, @created_at)
+        (message_id, guild_id, channel_id, author_id, author_tag, author_avatar_url, content, attachment_urls, matched_reasons, created_at, delivery_batch_plan_version)
+        VALUES (@message_id, @guild_id, @channel_id, @author_id, @author_tag, @author_avatar_url, @content, @attachment_urls, @matched_reasons, @created_at, 2)
         ON CONFLICT(message_id) DO UPDATE SET guild_id=excluded.guild_id, channel_id=excluded.channel_id,
-          author_id=excluded.author_id, author_tag=excluded.author_tag, content=excluded.content,
-          attachment_urls=excluded.attachment_urls, matched_reasons=excluded.matched_reasons, created_at=excluded.created_at`).run(message);
+          author_id=excluded.author_id, author_tag=excluded.author_tag, author_avatar_url=excluded.author_avatar_url,
+          content=excluded.content, attachment_urls=excluded.attachment_urls,
+          matched_reasons=excluded.matched_reasons, created_at=excluded.created_at`)
+        .run({ ...message, author_avatar_url: message.author_avatar_url ?? null });
       this.db.prepare("DELETE FROM attachments WHERE message_id = ?").run(message.message_id);
       let storedBytes = Number((this.db.prepare("SELECT COALESCE(SUM(LENGTH(bytes)), 0) AS total FROM attachments").get() as { total: number }).total);
       const insert = this.db.prepare(`INSERT INTO attachments

@@ -83,15 +83,16 @@ describe("monitor command execution", () => {
     const store = { setReviewChannel: vi.fn() };
     const denied = await executeMonitorCommand({
       guildId: "g1", path: "review-channel", values: { channelId: "c1" },
-      reviewChannelPermissions: { viewChannel: true, sendMessages: false, attachFiles: false },
+      reviewChannelPermissions: { viewChannel: true, sendMessages: false, embedLinks: false, attachFiles: false },
     }, store as never);
     expect(store.setReviewChannel).not.toHaveBeenCalled();
     expect(denied.content).toContain("Send Messages");
+    expect(denied.content).toContain("Embed Links");
     expect(denied.content).toContain("Attach Files");
 
     await executeMonitorCommand({
       guildId: "g1", path: "review-channel", values: { channelId: "c1" },
-      reviewChannelPermissions: { viewChannel: true, sendMessages: true, attachFiles: true },
+      reviewChannelPermissions: { viewChannel: true, sendMessages: true, embedLinks: true, attachFiles: true },
     }, store as never);
     expect(store.setReviewChannel).toHaveBeenCalledWith("g1", "c1");
   });
@@ -120,7 +121,7 @@ describe("monitor command execution", () => {
     expect(monitoredChannelPermissionError("visible", true)).toBeNull();
     const output = formatDiagnostics({
       reviewChannelId: "review",
-      reviewPermissions: { viewChannel: true, sendMessages: false, attachFiles: true },
+      reviewPermissions: { viewChannel: true, sendMessages: false, embedLinks: true, attachFiles: true },
       includedChannelIds: ["visible", "hidden"],
       inaccessibleChannelIds: ["hidden"],
     });
