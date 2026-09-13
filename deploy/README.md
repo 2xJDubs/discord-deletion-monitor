@@ -1,6 +1,6 @@
 # Production deployment
 
-These files deploy one Discord Deletion Monitor instance in a dedicated Debian 13 LXC. SQLite must remain on local storage; do not put the database on NFS or run multiple bot replicas against one file.
+These files deploy one Discord Deletion Monitor instance in a dedicated Debian 13 LXC. Complete the [Discord application and least-privileged Guild Install setup](../README.md#create-and-install-the-discord-application) before host installation. SQLite must remain on local storage; do not put the database on NFS or run multiple bot replicas against one file.
 
 ## Capacity and LXC sizing
 
@@ -89,6 +89,28 @@ Installed state:
 - root-only environments: `/etc/discord-deletion-monitor.env` and `/etc/discord-deletion-monitor-backup.env`
 - service account: `discord-monitor` (no login shell)
 
+## Consolidated post-install verification
+
+Complete this checklist after first install and every update:
+
+1. **Readiness and registration:** require `systemctl is-active discord-deletion-monitor` to print `active`, then check logs created after the current start for `"event":"client_ready"`. In Discord, verify `/monitor help` appears and responds ephemerally. If it is absent, confirm the `applications.commands` install scope, allow global-command propagation time, restart the Discord client, and inspect registration errors in the service journal.
+2. **Configuration and persistence:** finish `/monitor review-channel`, `/monitor setup`, and `/monitor diagnostics`; then record `/monitor settings`. Restart with `sudo systemctl restart discord-deletion-monitor`, require a new `client_ready`, and verify `/monitor settings` is unchanged.
+3. **Controlled evidence test:** post and delete a harmless distinctive message in one selected channel. Verify the review channel receives one red embed with the linked original author, channel, exact text, message ID, deletion timestamp, and no ping. For attachment capture when enabled, repeat with a harmless small file.
+4. **Database health:** while the service is running, ensure `/var/lib/discord-deletion-monitor/messages.db` exists, is owned by `discord-monitor`, and the journal contains no `database`, `SQLITE`, delivery-loop, or repeated retry failures. Do not validate by raw-copying the live WAL database.
+5. **Backup integrity:** start one online backup, identify the newly created regular `.db`, and run read-only integrity and foreign-key checks:
+   ```bash
+   sudo systemctl start discord-deletion-monitor-backup.service
+   sudo systemctl show discord-deletion-monitor-backup.service -p Result -p ExecMainStatus
+   # Require Result=success and ExecMainStatus=0 before continuing.
+   backup=$(sudo find /var/backups/discord-deletion-monitor -maxdepth 1 -type f -name '*.db' -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')
+   sudo test -n "$backup"
+   sudo sqlite3 "file:$backup?mode=ro&immutable=1" 'PRAGMA quick_check;' | grep -x ok
+   sudo sh -c 'output=$(sqlite3 "$1" "PRAGMA foreign_key_check;") && test -z "$output"' sh "file:$backup?mode=ro&immutable=1"
+   ```
+6. **Timer and logs:** require `systemctl is-enabled discord-deletion-monitor-backup.timer` to print `enabled`; inspect `systemctl list-timers discord-deletion-monitor-backup.timer`, the main-service journal, and backup-service journal. Verify the listed next run and investigate warnings, restarts, stale backups, or repeated delivery retries.
+
+Only treat installation as complete after all six checks pass. Practice the restore runbook below on a non-production copy; a backup that has never been restored is not yet operationally proven.
+
 ## Update, backup gate, and guarded rollback
 
 Update a trusted checkout and review it before running `sudo ./deploy/update.sh`. If `messages.db` exists, activation is blocked until the already-built and tested **new release's** backup CLI opens the source through its non-migrating backup path, creates and integrity-checks a new backup, and the installer independently confirms a new regular file with a SQLite header. The gate runs before the active symlink changes, including on a first install importing an existing database.
@@ -147,8 +169,8 @@ Use a standalone online-backup `.db`, not a raw copy of a live WAL database.
      /var/lib/discord-deletion-monitor/.messages.db.restore
    sudo sqlite3 'file:/var/lib/discord-deletion-monitor/.messages.db.restore?mode=ro&immutable=1' \
      'PRAGMA quick_check;' | grep -x ok
-   sudo sqlite3 'file:/var/lib/discord-deletion-monitor/.messages.db.restore?mode=ro&immutable=1' \
-     'PRAGMA foreign_key_check;' | { ! grep -q .; }
+   sudo sh -c 'output=$(sqlite3 "$1" "PRAGMA foreign_key_check;") && test -z "$output"' sh \
+     'file:/var/lib/discord-deletion-monitor/.messages.db.restore?mode=ro&immutable=1'
    ```
    The application's backup CLI opens its source through a non-migrating path (it does not apply schema migrations while producing a backup), so it is safe to use for creating the candidate backup itself. It is still not a read-only *validation* command, so validate the staged restore candidate with the immutable SQLite checks above rather than by opening it through the application. A future `maintenance check --read-only` command is a **design placeholder only and must not be run or scripted until it exists**.
 4. Stage permissions and atomically rename within the data filesystem:

@@ -1,11 +1,14 @@
 import Database from "better-sqlite3";
+import { execFile } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { MessageStore, type StoredAttachment, type StoredMessage } from "./database.js";
 
 const dirs: string[] = [];
+const execFileAsync = promisify(execFile);
 function tempPath(name = "messages.db"): string {
   const dir = mkdtempSync(join(tmpdir(), "deletion-monitor-"));
   dirs.push(dir);
@@ -26,6 +29,51 @@ const attachment: StoredAttachment = {
 afterEach(() => dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true })));
 
 describe("MessageStore", () => {
+  it("serializes concurrent v4 migrations before schema inspection", async () => {
+    const path = tempPath();
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE guild_config (
+        guild_id TEXT PRIMARY KEY, review_channel_id TEXT,
+        retention_minutes INTEGER NOT NULL DEFAULT 60,
+        mode TEXT NOT NULL DEFAULT 'all', monitoring_configured INTEGER NOT NULL DEFAULT 1,
+        monitor_administrators INTEGER NOT NULL DEFAULT 0,
+        monitor_attachments INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE rules (guild_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (guild_id, kind, value));
+      CREATE TABLE messages (
+        message_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+        author_id TEXT NOT NULL, author_tag TEXT NOT NULL, content TEXT NOT NULL,
+        attachment_urls TEXT NOT NULL, matched_reasons TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL, deleted_at TEXT, delivery_attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT, last_delivery_error TEXT, delivery_claim_token TEXT,
+        delivery_claimed_until TEXT, delivery_batch_index INTEGER NOT NULL DEFAULT 0
+      );
+      WITH RECURSIVE rows(id) AS (VALUES(1) UNION ALL SELECT id + 1 FROM rows WHERE id < 5000)
+      INSERT INTO messages (message_id, guild_id, channel_id, author_id, author_tag, content, attachment_urls, created_at)
+      SELECT printf('m%05d', id), 'g1', 'c1', 'u1', 'user', 'content', '[]', '2026-01-01T00:00:00.000Z' FROM rows;
+      PRAGMA user_version = 4;
+    `);
+    legacy.close();
+
+    const startAt = Date.now() + 1_000;
+    const source = `
+      import { MessageStore } from './src/database.ts';
+      while (Date.now() < Number(process.argv[1])) await new Promise((resolve) => setTimeout(resolve, 1));
+      const store = new MessageStore(process.argv[2], 60, { busyTimeoutMs: 5000 });
+      store.close();
+    `;
+    await Promise.all(Array.from({ length: 8 }, () => execFileAsync(process.execPath, [
+      "--import", "tsx", "--input-type=module", "--eval", source, String(startAt), path,
+    ], { cwd: process.cwd(), timeout: 20_000 })));
+
+    const migrated = new Database(path, { readonly: true });
+    expect(migrated.pragma("user_version", { simple: true })).toBe(6);
+    expect(migrated.pragma("quick_check", { simple: true })).toBe("ok");
+    expect(migrated.pragma("foreign_key_check")).toEqual([]);
+    migrated.close();
+  }, 30_000);
+
   it("migrates the complete origin schema and preserves its data", () => {
     const path = tempPath();
     const legacy = new Database(path);
@@ -42,6 +90,74 @@ describe("MessageStore", () => {
     expect(store.getConfig("g1").review_channel_id).toBe("review");
     expect(store.listRules("g1", "keyword")).toEqual(["urgent"]);
     expect(store.get("m1")).toMatchObject({ content: "legacy", deleted_at: null, delivery_attempts: 0 });
+    store.close();
+  });
+
+  it("adds nullable author avatar presentation data without changing legacy rows", () => {
+    const path = tempPath();
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE messages (
+        message_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+        author_id TEXT NOT NULL, author_tag TEXT NOT NULL, content TEXT NOT NULL,
+        attachment_urls TEXT NOT NULL, matched_reasons TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL, deleted_at TEXT, delivery_attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT, last_delivery_error TEXT, delivery_claim_token TEXT,
+        delivery_claimed_until TEXT, delivery_batch_index INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO messages (message_id, guild_id, channel_id, author_id, author_tag, content, attachment_urls, created_at)
+      VALUES ('legacy', 'g1', 'c1', 'u1', 'old user', 'unchanged', '[]', '2026-01-01T00:00:00.000Z');
+      PRAGMA user_version = 4;
+    `);
+    legacy.close();
+
+    const store = new MessageStore(path, 60);
+    expect(store.get("legacy")).toMatchObject({
+      content: "unchanged", author_avatar_url: null, delivery_batch_plan_version: 1,
+    });
+    store.close();
+    const migrated = new Database(path, { readonly: true });
+    expect(migrated.pragma("user_version", { simple: true })).toBe(6);
+    migrated.close();
+  });
+
+  it("preserves v0.3 batch-plan identity when migrating current partial progress", () => {
+    const path = tempPath();
+    const current = new Database(path);
+    current.exec(`
+      CREATE TABLE messages (
+        message_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+        author_id TEXT NOT NULL, author_tag TEXT NOT NULL, author_avatar_url TEXT,
+        content TEXT NOT NULL, attachment_urls TEXT NOT NULL,
+        matched_reasons TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+        deleted_at TEXT, delivery_attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT, last_delivery_error TEXT, delivery_claim_token TEXT,
+        delivery_claimed_until TEXT, delivery_batch_index INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO messages (
+        message_id, guild_id, channel_id, author_id, author_tag, content,
+        attachment_urls, created_at, delivery_batch_index
+      ) VALUES ('partial', 'g1', 'c1', 'u1', 'user', 'unchanged', '[]',
+        '2026-01-01T00:00:00.000Z', 1);
+      PRAGMA user_version = 5;
+    `);
+    current.close();
+
+    const store = new MessageStore(path, 60);
+    expect(store.get("partial")).toMatchObject({
+      delivery_batch_index: 1, delivery_batch_plan_version: 2,
+    });
+    store.close();
+  });
+
+  it("persists capture-time avatar presentation data across restart", () => {
+    const path = tempPath();
+    let store = new MessageStore(path, 60);
+    store.save({ ...message(), author_avatar_url: "https://cdn.discordapp.com/avatars/123/avatar.png" });
+    store.close();
+
+    store = new MessageStore(path, 60);
+    expect(store.get("m1")?.author_avatar_url).toBe("https://cdn.discordapp.com/avatars/123/avatar.png");
     store.close();
   });
 
@@ -250,10 +366,13 @@ describe("MessageStore", () => {
     store.claimDelivery("m1", "worker-a", new Date("2026-01-01T00:00:00Z"), 60_000);
     expect(store.advanceDeliveryBatch("m1", "worker-a", 1)).toBe(true);
     store.save({ ...message(), content: "edited snapshot" });
-    expect(store.get("m1")).toMatchObject({ delivery_batch_index: 1, delivery_claim_token: "worker-a", deleted_at: "2026-01-01T00:00:00.000Z" });
+    expect(store.get("m1")).toMatchObject({
+      delivery_batch_index: 1, delivery_batch_plan_version: 2,
+      delivery_claim_token: "worker-a", deleted_at: "2026-01-01T00:00:00.000Z",
+    });
     store.close();
     store = new MessageStore(path, 336);
-    expect(store.get("m1")?.delivery_batch_index).toBe(1);
+    expect(store.get("m1")).toMatchObject({ delivery_batch_index: 1, delivery_batch_plan_version: 2 });
     store.close();
   });
 

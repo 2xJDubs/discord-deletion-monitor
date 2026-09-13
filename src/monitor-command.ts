@@ -57,7 +57,7 @@ export type MonitorCommandRequest = {
   guildId: string;
   path: string;
   values: Record<string, string | number | boolean | null | undefined>;
-  reviewChannelPermissions?: { viewChannel: boolean; sendMessages: boolean; attachFiles: boolean };
+  reviewChannelPermissions?: { viewChannel: boolean; sendMessages: boolean; embedLinks: boolean; attachFiles: boolean };
 };
 export type MonitorCommandResult = { content: string; ephemeral: true };
 export async function executeDeferredEphemeral(
@@ -99,6 +99,7 @@ export async function executeMonitorCommand(request: MonitorCommandRequest, stor
     const missing = [
       !permissions?.viewChannel && "View Channel",
       !permissions?.sendMessages && "Send Messages",
+      !permissions?.embedLinks && "Embed Links",
       !permissions?.attachFiles && "Attach Files",
     ].filter(Boolean);
     if (missing.length) return { content: `I cannot use that channel. Grant me: ${missing.join(", ")}.`, ephemeral: true };
@@ -142,7 +143,7 @@ export function monitoredChannelPermissionError(channelId: string, viewChannel: 
 export function formatDiagnostics(input: {
   monitoringConfigured?: boolean;
   reviewChannelId: string | null;
-  reviewPermissions?: { viewChannel: boolean; sendMessages: boolean; attachFiles: boolean };
+  reviewPermissions?: { viewChannel: boolean; sendMessages: boolean; embedLinks: boolean; attachFiles: boolean };
   includedChannelIds: string[];
   inaccessibleChannelIds: string[];
 }): string {
@@ -153,6 +154,7 @@ export function formatDiagnostics(input: {
     const missing = [
       !input.reviewPermissions?.viewChannel && "View Channel",
       !input.reviewPermissions?.sendMessages && "Send Messages",
+      !input.reviewPermissions?.embedLinks && "Embed Links",
       !input.reviewPermissions?.attachFiles && "Attach Files",
     ].filter(Boolean);
     if (missing.length) problems.push(`Review channel <#${input.reviewChannelId}> is missing: ${missing.join(", ")}.`);

@@ -20,11 +20,12 @@ import { deliverWithClaim } from "./delivery-claim.js";
 import { deliverEvidence } from "./evidence.js";
 import { createDeliveryRetryWorker } from "./retry-worker.js";
 import { ActiveWorkTracker, createJsonLogger, installGracefulShutdown, safeAsyncHandler } from "./runtime.js";
-import { createGuildDeleteHandler, createMessageEventPolicy, type MonitorMessage } from "./message-policy.js";
+import { createGuildDeleteHandler, createMessageEventPolicy } from "./message-policy.js";
 import { buildMonitorCommand, executeDeferredEphemeral, executeMonitorCommand, formatDiagnostics, formatSettings } from "./monitor-command.js";
 import { MessageStore } from "./database.js";
 import { MonitorSetupFlow, parseSetupCustomId, renderSetupView } from "./setup-flow.js";
 import { executeDirectChannelInclusion, replyForUnavailableGuild, respondToInteractionFailure } from "./interaction-routing.js";
+import { toMonitorMessage } from "./discord-message.js";
 
 
 const config = loadConfig();
@@ -85,28 +86,6 @@ const policy = createMessageEventPolicy({
 const handleGuildDelete = createGuildDeleteHandler(store);
 const setupFlow = new MonitorSetupFlow(store);
 
-function toMonitorMessage(message: {
-  id: string; guildId: string | null; channelId: string; content: string; createdAt: Date;
-  author: { id: string; tag: string; bot: boolean } | null; webhookId: string | null;
-  member: { permissions: { has(flag: bigint): boolean }; roles: { cache: Map<string, unknown> } } | null;
-  attachments: Iterable<{ id: string; url: string; name: string; contentType: string | null; size: number }>;
-  partial: boolean;
-  fetch?: () => Promise<unknown>;
-}): MonitorMessage {
-  const sources = [...message.attachments].map((attachment) => ({
-    id: attachment.id, url: attachment.url, name: attachment.name, contentType: attachment.contentType, size: attachment.size,
-  }));
-  return {
-    id: message.id, guildId: message.guildId, channelId: message.channelId, content: message.content,
-    createdAt: message.createdAt, author: message.author,
-    webhookId: message.webhookId,
-    administrator: message.member?.permissions.has(PermissionFlagsBits.Administrator) ?? false,
-    roleIds: message.member ? [...message.member.roles.cache].map(([id]) => id as string) : [],
-    attachments: sources,
-    partial: message.partial,
-    fetch: message.fetch ? async () => toMonitorMessage(await message.fetch!() as never) : undefined,
-  };
-}
 
 async function inaccessibleChannelIds(guild: Guild, channelIds: string[]): Promise<string[]> {
   const me = guild.members.me ?? await guild.members.fetchMe();
@@ -125,6 +104,7 @@ async function reviewPermissions(guild: Guild, channelId: string | null) {
   return {
     viewChannel: permissions?.has(PermissionFlagsBits.ViewChannel) ?? false,
     sendMessages: permissions?.has(PermissionFlagsBits.SendMessages) ?? false,
+    embedLinks: permissions?.has(PermissionFlagsBits.EmbedLinks) ?? false,
     attachFiles: permissions?.has(PermissionFlagsBits.AttachFiles) ?? false,
   };
 }
@@ -166,7 +146,7 @@ async function handleCommand(interaction: ChatInputCommandInteraction): Promise<
     if (path === "help") values.topic = interaction.options.getString("topic", false);
     if (path === "forget") values.confirm = interaction.options.getString("confirm", true);
     if (path === "administrators" || path === "attachments") values.value = interaction.options.getString("value", true);
-    let reviewChannelPermissions: { viewChannel: boolean; sendMessages: boolean; attachFiles: boolean } | undefined;
+    let reviewChannelPermissions: { viewChannel: boolean; sendMessages: boolean; embedLinks: boolean; attachFiles: boolean } | undefined;
     let channel: { id: string } | undefined;
     if (path === "review-channel") {
       channel = interaction.options.getChannel("channel", true);
@@ -176,6 +156,7 @@ async function handleCommand(interaction: ChatInputCommandInteraction): Promise<
       reviewChannelPermissions = {
         viewChannel: permissions?.has(PermissionFlagsBits.ViewChannel) ?? false,
         sendMessages: permissions?.has(PermissionFlagsBits.SendMessages) ?? false,
+        embedLinks: permissions?.has(PermissionFlagsBits.EmbedLinks) ?? false,
         attachFiles: permissions?.has(PermissionFlagsBits.AttachFiles) ?? false,
       };
     }
