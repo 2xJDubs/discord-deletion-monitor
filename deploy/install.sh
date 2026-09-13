@@ -75,8 +75,19 @@ cleanup() {
 trap cleanup EXIT
 
 # Root copies only declared build inputs; dependency scripts run as BUILD_USER.
-install -d -o "$BUILD_USER" -g "$BUILD_USER" -m 0700 "$STAGE/src"
-for file in package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json tsconfig.build.json; do
+install -d -o "$BUILD_USER" -g "$BUILD_USER" -m 0700 \
+  "$STAGE/src" "$STAGE/deploy" "$STAGE/docs"
+STAGED_FILES=(
+  package.json
+  pnpm-lock.yaml
+  pnpm-workspace.yaml
+  tsconfig.json
+  tsconfig.build.json
+  README.md
+  deploy/README.md
+  docs/data-retention.md
+)
+for file in "${STAGED_FILES[@]}"; do
   install -o "$BUILD_USER" -g "$BUILD_USER" -m 0644 "$SOURCE_DIR/$file" "$STAGE/$file"
 done
 cp -a "$SOURCE_DIR/src/." "$STAGE/src/"
