@@ -17,6 +17,14 @@ describe("captureMessage", () => {
     expect(save).toHaveBeenCalledWith(expect.objectContaining({ message_id: "m1", attachment_urls: JSON.stringify(["https://cdn.test/a"]) }), bytes);
   });
 
+  it("stores the immutable author avatar URL with the captured snapshot", async () => {
+    const save = vi.fn();
+    await captureMessage({ ...snapshot, authorAvatarUrl: "https://cdn.discordapp.com/avatars/123/avatar.png" }, { save }, async () => []);
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({
+      author_avatar_url: "https://cdn.discordapp.com/avatars/123/avatar.png",
+    }), []);
+  });
+
   it("still saves message text when attachment downloading returns no files", async () => {
     const save = vi.fn();
     await expect(captureMessage(snapshot, { save }, async () => [])).resolves.toBeUndefined();

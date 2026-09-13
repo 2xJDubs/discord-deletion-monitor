@@ -9,7 +9,7 @@ export type MonitorMessage = {
   channelId: string;
   content: string;
   createdAt: Date;
-  author: { id: string; tag: string; bot: boolean } | null;
+  author: { id: string; tag: string; displayName?: string; avatarUrl?: string | null; bot: boolean } | null;
   webhookId: string | null;
   administrator: boolean;
   roleIds: string[];
@@ -73,7 +73,8 @@ export function createMessageEventPolicy(deps: {
     if (config.mode === "matching" && !reasons.length) return false;
     return deps.coordinator.capture({
       messageId: message.id, guildId, channelId: message.channelId,
-      authorId: message.author.id, authorTag: message.author.tag, content: message.content,
+      authorId: message.author.id, authorTag: message.author.displayName || message.author.tag,
+      authorAvatarUrl: message.author.avatarUrl ?? null, content: message.content,
       createdAt: message.createdAt, reasons, attachments: message.attachments,
     });
   }

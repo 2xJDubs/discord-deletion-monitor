@@ -7,9 +7,9 @@ Discord Deletion Monitor temporarily processes message content for moderation ev
 For messages selected by the configured monitoring policy, the bot may store:
 
 - Discord message, guild, channel, and author identifiers
-- the author's Discord tag at capture time
+- the author's display name/tag and Discord CDN avatar URL at capture time (legacy rows may have no avatar URL)
 - message text and detection reasons
-- posting timestamp
+- posting and, after a deletion event, deletion timestamps
 - downloaded attachment filename, media type, size, and bytes, subject to configured limits
 
 The Discord token is never stored in SQLite.

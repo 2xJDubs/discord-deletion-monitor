@@ -48,6 +48,19 @@ describe("message event policy", () => {
     }));
   });
 
+  it("captures the display name and avatar used when the message was seen", async () => {
+    const ctx = setup();
+    ctx.store.getConfig.mockReturnValue({ mode: "all", monitor_administrators: false, monitor_attachments: false });
+
+    await ctx.policy.create(message({ author: {
+      id: "123456789012345678", tag: "account-tag", displayName: "Server Display", avatarUrl: "https://cdn.discordapp.com/avatar.png", bot: false,
+    } }));
+
+    expect(ctx.coordinator.capture).toHaveBeenCalledWith(expect.objectContaining({
+      authorTag: "Server Display", authorAvatarUrl: "https://cdn.discordapp.com/avatar.png",
+    }));
+  });
+
   it("fetches a partial update and captures a newly matching edit", async () => {
     const ctx = setup();
     const fetched = message({ content: "this is urgent", partial: false });

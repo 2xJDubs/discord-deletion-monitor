@@ -7,6 +7,7 @@ export type MessageSnapshot = {
   channelId: string;
   authorId: string;
   authorTag: string;
+  authorAvatarUrl?: string | null;
   content: string;
   createdAt: Date;
   reasons: string[];
@@ -23,6 +24,7 @@ export async function captureMessage(snapshot: MessageSnapshot, store: CaptureSt
     channel_id: snapshot.channelId,
     author_id: snapshot.authorId,
     author_tag: snapshot.authorTag,
+    author_avatar_url: snapshot.authorAvatarUrl ?? null,
     content: snapshot.content,
     attachment_urls: JSON.stringify(snapshot.attachments.map((attachment) => attachment.url)),
     matched_reasons: JSON.stringify(snapshot.reasons),
