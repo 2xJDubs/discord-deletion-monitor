@@ -60,4 +60,16 @@ require 'PRAGMA foreign_key_check' deploy/README.md \
 require 'PRAGMA quick_check' deploy/README.md \
   'restore runbook must require quick_check before activation'
 
+mapfile -t DOCUMENTATION_INPUTS < <(
+  sed -n 's/.*read("\.\.\/\([^"]*\)").*/\1/p' "$ROOT/src/documentation.test.ts" | sort -u
+)
+mapfile -t STAGED_FILES < <(
+  sed -n '/^STAGED_FILES=(/,/^)/p' "$ROOT/deploy/install.sh" |
+    sed -n 's/^[[:space:]]*\([^()[:space:]]\+\)[[:space:]]*$/\1/p'
+)
+for input in "${DOCUMENTATION_INPUTS[@]}"; do
+  printf '%s\n' "${STAGED_FILES[@]}" | grep -Fqx -- "$input" ||
+    fail "installer stage omits documentation test input: $input"
+done
+
 printf '%s\n' 'operational static tests passed'
