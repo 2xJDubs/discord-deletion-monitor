@@ -283,7 +283,7 @@ function firstEmbedDescription(evidence: StoredEvidence, deletionLine: string): 
 export function buildEvidencePayloads(evidence: StoredEvidence, batchPlanVersion = 2): EvidencePayload[] {
   const authorLabel = safeAuthorLabel(evidence.message.author_tag, evidence.message.author_id);
   const authorIdentity = /^\d{17,20}$/.test(evidence.message.author_id)
-    ? `[${authorLabel.markdown}](https://discord.com/users/${evidence.message.author_id})`
+    ? `<@${evidence.message.author_id}>`
     : authorLabel.markdown;
   const channelIdentity = /^\d{17,20}$/.test(evidence.message.channel_id)
     ? `<#${evidence.message.channel_id}>`
