@@ -6,7 +6,7 @@ A multi-server Discord bot that caches eligible messages and sends evidence to e
 
 - Node.js **22.13 or newer** (production uses Node 22 LTS), pnpm **11.19.0**, Git, outbound HTTPS/DNS, and a Discord account allowed to create applications and use **Manage Server** in each target guild.
 - Local development is supported anywhere Node and the native `better-sqlite3` dependency build successfully. The supported production path is one dedicated **Debian 13 systemd host/LXC** with SQLite on local storage. Do not place SQLite on NFS or run multiple bot replicas against one database.
-- This repository is private. The operator must already have repository access or a read-only deploy key; a Discord invite does not grant source access. Never embed a GitHub token in a clone URL.
+- Never embed a GitHub token in a clone URL.
 
 ## Create and install the Discord application
 
