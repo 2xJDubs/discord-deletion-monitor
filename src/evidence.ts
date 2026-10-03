@@ -255,7 +255,7 @@ function legacyV02AttachesContent(evidence: StoredEvidence): boolean {
   const timestamp = Math.floor(new Date(message.created_at).getTime() / 1000);
   const header = [
     "**Deleted message captured**",
-    `Author: ${escapeDiscordMarkdown(message.author_tag)} (\`${message.author_id}\`)`,
+    `Author: ${escapeDiscordMarkdown(message.author_tag)} (<@${message.author_id}> \`${message.author_id}\`)`,
     `Channel: <#${message.channel_id}>`,
     `Posted: <t:${timestamp}:F>`,
     values.length ? `Matched: ${values.map((reason) => escapeDiscordMarkdown(String(reason))).join(", ")}` : "Matched: all-message mode",
