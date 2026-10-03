@@ -30,7 +30,7 @@ describe("buildEvidencePayload", () => {
     expect(payloads.length).toBe(3);
     expect(payloads.every((payload) => payload.files.length <= 10)).toBe(true);
     expect(payloads[0].files[0].name).toBe("0.txt");
-    expect(payloads.every((payload) => payload.embeds[0].description.includes("https://discord.com/users/123456789012345678"))).toBe(true);
+    expect(payloads.every((payload) => payload.embeds[0].description.includes("<@123456789012345678> (`123456789012345678`)"))).toBe(true);
   });
   it("formats short evidence under 2,000 characters with mentions disabled and preserved files", () => {
     const payload = buildEvidencePayload(evidence());
@@ -41,7 +41,7 @@ describe("buildEvidencePayload", () => {
     expect(payload.files).toEqual([expect.objectContaining({ name: "proof.txt", attachment: Buffer.from("proof") })]);
   });
 
-  it("links the original author in a MEE6-style deletion embed", () => {
+  it("uses a non-pinging guild member mention with a visible user-ID fallback", () => {
     const item = evidence();
     item.message.author_id = "123456789012345678";
     item.message.author_tag = "ordinary user";
@@ -52,10 +52,11 @@ describe("buildEvidencePayload", () => {
     expect(payload.embeds).toEqual([expect.objectContaining({
       color: 0xed4245,
       author: expect.objectContaining({ name: "ordinary user" }),
-      description: expect.stringContaining("[ordinary user](https://discord.com/users/123456789012345678)"),
+      description: expect.stringContaining("<@123456789012345678> (`123456789012345678`)"),
       footer: { text: "Message ID: m1" },
       timestamp: "2026-01-02T03:04:05.000Z",
     })]);
+    expect(payload.embeds[0].description).not.toContain("https://discord.com/users/");
     expect(payload.allowedMentions).toEqual({ parse: [], repliedUser: false });
   });
 
@@ -128,7 +129,7 @@ describe("buildEvidencePayload", () => {
     expect(buildEvidencePayload(item).embeds[0].author.icon_url).toBeUndefined();
   });
 
-  it("neutralizes Markdown and controls in the linked author label with an ID fallback", () => {
+  it("keeps attacker-controlled author labels out of the member mention while preserving a safe compact header", () => {
     const item = evidence();
     item.message.author_id = "123456789012345678";
     item.message.author_tag = "**admin**\n[spoof](https://evil.test)\u202e @everyone";
@@ -136,12 +137,14 @@ describe("buildEvidencePayload", () => {
     const payload = buildEvidencePayload(item);
     const description = payload.embeds[0].description;
 
-    expect(description).toContain("[\\*\\*admin\\*\\* \\[spoof\\]\\(https://evil\\.test\\) @ everyone](https://discord.com/users/123456789012345678)");
+    expect(payload.embeds[0].author.name).toBe("**admin** [spoof](https://evil.test) @ everyone");
+    expect(description).toContain("<@123456789012345678> (`123456789012345678`)");
+    expect(description).not.toContain("evil.test");
     expect(description.split("\n", 1)[0]).not.toMatch(/[\r\u202e]/u);
 
     item.message.author_tag = "\u0000\u202e\n";
     expect(buildEvidencePayload(item).embeds[0].description)
-      .toContain("[123456789012345678](https://discord.com/users/123456789012345678)");
+      .toContain("<@123456789012345678> (`123456789012345678`)");
   });
 
   it("sanitizes a malformed author-ID fallback when the display name is unavailable", () => {
@@ -326,19 +329,6 @@ describe("buildEvidencePayload", () => {
         extract: (payload) => payload.embeds[0].author.name,
       },
       {
-        name: "author link label/description",
-        pad: 125, // limit 128
-        build: (item, padded) => {
-          item.message.author_id = "123456789012345678";
-          item.message.author_tag = padded;
-        },
-        extract: (payload) => {
-          const match = payload.embeds[0].description.match(/\[(.*)]\(https:\/\/discord\.com\/users\//);
-          if (!match) throw new Error("expected a linked author label in the description");
-          return match[1];
-        },
-      },
-      {
         name: "matched-reason field",
         pad: 477, // limit 480
         build: (item, padded) => { item.message.matched_reasons = JSON.stringify([padded]); },
@@ -422,7 +412,7 @@ describe("buildEvidencePayload", () => {
 
     expect(payload.embeds[0].author.name.length).toBeLessThanOrEqual(256);
     expect(payload.embeds[0].description.length).toBeLessThanOrEqual(4096);
-    expect(payload.embeds[0].description).toContain("https://discord.com/users/123456789012345678");
+    expect(payload.embeds[0].description).toContain("<@123456789012345678> (`123456789012345678`)");
   });
 
   it("bounds and neutralizes malformed legacy message IDs in embed footers", () => {
@@ -454,7 +444,7 @@ describe("buildEvidencePayload", () => {
     item.message.matched_reasons = JSON.stringify(["keyword: **urgent**", "pattern: ||hide||"]);
     const payload = buildEvidencePayload(item);
     expect(payload.embeds[0].description).toContain("> \\# heading \\*\\*bold\\*\\* \\[link\\]\\(https://evil\\.test\\) \\|\\|spoiler\\|\\|");
-    expect(payload.embeds[0].description).toContain("[\\*\\*admin\\*\\* \\`code\\`");
+    expect(payload.embeds[0].author.name).toContain("**admin** `code`");
     expect(payload.allowedMentions).toEqual({ parse: [], repliedUser: false });
     expect(payload.embeds[0].description).not.toContain("<@123>");
     expect(payload.embeds[0].description).not.toContain("@everyone");
@@ -565,7 +555,7 @@ describe("buildEvidencePayload", () => {
     const payload = buildEvidencePayload(evidence(content));
     expect(payload.content).toBe("");
     expect(payload.embeds[0].description).toContain("attached as **deleted-message-m1.txt**");
-    expect(payload.embeds[0].description).toContain("https://discord.com/users/123456789012345678");
+    expect(payload.embeds[0].description).toContain("<@123456789012345678> (`123456789012345678`)");
     const contentFile = payload.files.find((file) => file.name === "deleted-message-m1.txt");
     expect(contentFile?.attachment.toString("utf8")).toBe(content);
     expect(payload.allowedMentions).toEqual({ parse: [], repliedUser: false });
@@ -752,7 +742,7 @@ describe("deliverEvidence", () => {
     ctx.send.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("batch two failed"));
     await expect(deliverEvidence("g1", "m1", "claim-a", ctx.store, ctx.fetchChannel, ctx.log)).resolves.toBe(false);
     expect(ctx.send).toHaveBeenCalledTimes(2);
-    expect(ctx.send.mock.calls.every(([payload]) => JSON.stringify(payload).includes("https://discord.com/users/123456789012345678"))).toBe(true);
+    expect(ctx.send.mock.calls.every(([payload]) => JSON.stringify(payload).includes("<@123456789012345678> (`123456789012345678`)"))).toBe(true);
     expect(ctx.store.removeClaimed).not.toHaveBeenCalled();
     expect(ctx.store.advanceDeliveryBatch).toHaveBeenCalledWith("m1", "claim-a", 1);
     expect(ctx.store.scheduleRetry).toHaveBeenCalled();
@@ -887,7 +877,7 @@ describe("deliverEvidence", () => {
     await expect(deliverEvidence("g1", "m1", "claim-b", ctx.store, ctx.fetchChannel, ctx.log)).resolves.toBe(true);
     expect(ctx.send).toHaveBeenCalledTimes(1);
     expect((ctx.send.mock.calls[0][0] as { files: Array<{ name: string }> }).files.map((file) => file.name)).toEqual(["10.txt"]);
-    expect(JSON.stringify(ctx.send.mock.calls[0][0])).toContain("https://discord.com/users/123456789012345678");
+    expect(JSON.stringify(ctx.send.mock.calls[0][0])).toContain("<@123456789012345678> (`123456789012345678`)");
     expect(ctx.store.advanceDeliveryBatch).toHaveBeenCalledWith("m1", "claim-b", 2);
     expect(ctx.store.removeClaimed).toHaveBeenCalledWith("m1", "claim-b");
   });
